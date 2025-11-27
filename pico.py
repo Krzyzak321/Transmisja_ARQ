@@ -9,14 +9,14 @@ RX_PIN = 21              # Pin do odbierania danych (Receive)
 # Konfiguracja czasowa i struktury ramki
 BIT_LEN_US = 1000         # Czas trwania jednego bitu w mikrosekundach
 PREAMBLE_LEN = 16        # Długość preambuły synchronizacyjnej
-DATA_BITS_LEN = 42        # Długość danych w bitach
+DATA_BITS_LEN = 32        # Długość danych w bitach
 TOTAL_BITS_LEN = PREAMBLE_LEN + DATA_BITS_LEN + 1  # Całkowita długość ramki
 
 # Definicja stałych sygnałów
 PREAMBLE = "1010101010101010"  # Sygnał synchronizujący - pomaga odbiorcy zsynchronizować się z nadajnikiem
-DATA_BITS = "11100010"         # Dane które chcemy przesłać
-ACK_SIGNAL = "11111111"        # Potwierdzenie poprawnego odbioru (ACKnowledge)
-NACK_SIGNAL = "00000000"       # Sygnał błędu (Negative ACKnowledge)
+DATA_BITS = "11100010111000101110001011100010";       # Dane które chcemy przesłać
+ACK_SIGNAL = "11111111111111111111111111111111";       # Potwierdzenie poprawnego odbioru (ACKnowledge)
+NACK_SIGNAL = "00000000000000000000000000000000";       # Sygnał błędu (Negative ACKnowledge)
 
 # Konfiguracja protokołu komunikacyjnego
 ACK_TIMEOUT_MS = 1000          # Czas oczekiwania na potwierdzenie
