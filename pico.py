@@ -1,16 +1,17 @@
 from machine import Pin
 import utime
+import machine
 
 # =========== KONFIGURACJA SYSTEMU ===========
 TX_PIN = 15
 RX_PIN = 21
 BIT_LEN_US = 990
 
-# --- Nowe stałe dla Hamminga ---
+# --- Stałe dla Hamminga ---
 PREAMBLE_LEN = 16
-HEADER_LEN = 12           # 4 typ + 4 sekw + 3 długość + 1 rezerwa  
-DATA_BITS_LEN = 26        # 26 bitów danych
-HAMMING_PARITY_LEN = 5    # 5 bitów parzystości Hamminga
+HEADER_LEN = 12
+DATA_BITS_LEN = 26
+HAMMING_PARITY_LEN = 5
 TOTAL_FRAME_LEN = PREAMBLE_LEN + HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN
 
 PREAMBLE = "1010101010101010"
@@ -18,18 +19,17 @@ PREAMBLE = "1010101010101010"
 # --- Typy ramek ---
 FRAME_TYPE_DATA = "0001"
 FRAME_TYPE_ACK = "0010"
-FRAME_TYPE_NACK = "0011" 
-FRAME_TYPE_SREJ = "0100"
+FRAME_TYPE_NACK = "0011"
 
 # --- Sygnały ACK/NACK ---
-ACK_DATA = "11111111111111111111111111"   # 26 jedynek
-NACK_DATA = "00000000000000000000000000"  # 26 zer
+ACK_DATA = "11111111111111111111111111"
+NACK_DATA = "00000000000000000000000000"
 
 # --- Dane testowe ---
-DATA_BITS = "11001100110011001100110001"  # 26 bitów danych
+DATA_BITS = "11001100110011001100110001"
 
 # --- Konfiguracja protokołu ---
-ACK_TIMEOUT_MS = 1000
+ACK_TIMEOUT_MS = 2000
 MAX_RETRANSMISSIONS = 1000
 
 # --- Inicjalizacja pinów ---
@@ -38,26 +38,22 @@ rx = Pin(RX_PIN, Pin.IN)
 tx.value(0)
 
 # =========== FUNKCJE HAMMINGA (31,26) ===========
-
 def calculate_hamming_parity(data):
-    # Tablica pozycji bitów danych w słowie 31-bitowym (indeksy 1..31)
     data_positions = [3,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
-    word = [0] * 32  # Słowie kodowe 31-bitowe (indeksy 1..31)
+    word = [0] * 32
     
-    # Wstaw bity danych na odpowiednie pozycje
     for i in range(26):
         pos = data_positions[i]
         word[pos] = 1 if data[i] == '1' else 0
     
-    # Oblicz bity parzystości
     p1 = p2 = p4 = p8 = p16 = 0
     
     for j in range(1, 32):
-        if j & 1: p1 ^= word[j]   # Bit 0: pozycje z ustawionym bitem 0
-        if j & 2: p2 ^= word[j]   # Bit 1: pozycje z ustawionym bitem 1
-        if j & 4: p4 ^= word[j]   # Bit 2: pozycje z ustawionym bitem 2
-        if j & 8: p8 ^= word[j]   # Bit 3: pozycje z ustawionym bitem 3
-        if j & 16: p16 ^= word[j] # Bit 4: pozycje z ustawionym bitem 4
+        if j & 1: p1 ^= word[j]
+        if j & 2: p2 ^= word[j]
+        if j & 4: p4 ^= word[j]
+        if j & 8: p8 ^= word[j]
+        if j & 16: p16 ^= word[j]
     
     return str(p1) + str(p2) + str(p4) + str(p8) + str(p16)
 
@@ -67,32 +63,29 @@ def verify_hamming(data, parity):
     return calculated_parity == parity
 
 # =========== FUNKCJE BUDOWANIA RAMEK ===========
-
 def build_data_frame(seq_num=0):
-    # Nagłówek: typ(4) + sekw(4) + długość(3) + rezerwa(1)
     seq_bits = f"{seq_num:04b}"
-    header = FRAME_TYPE_DATA + seq_bits + "1100"  # długość=6 (110), rezerwa=0
+    header = FRAME_TYPE_DATA + seq_bits + "1100"
     parity = calculate_hamming_parity(DATA_BITS)
     print(f"Wysyłane dane: {DATA_BITS}, Wysyłana parzystość: {parity}")
     return PREAMBLE + header + DATA_BITS + parity
 
 def build_ack_frame(seq_num=0):
     seq_bits = f"{seq_num:04b}"
-    header = FRAME_TYPE_ACK + seq_bits + "1100"  # długość=6 (110), rezerwa=0
+    header = FRAME_TYPE_ACK + seq_bits + "1100"
     parity = calculate_hamming_parity(ACK_DATA)
     return PREAMBLE + header + ACK_DATA + parity
 
 def build_nack_frame(seq_num=0):
     seq_bits = f"{seq_num:04b}"
-    header = FRAME_TYPE_NACK + seq_bits + "1100"  # długość=6 (110), rezerwa=0
+    header = FRAME_TYPE_NACK + seq_bits + "1100"
     parity = calculate_hamming_parity(NACK_DATA)
     return PREAMBLE + header + NACK_DATA + parity
 
-# =========== POZOSTAŁE FUNKCJE (POPRAWIONE TIMINGI) ===========
-
+# =========== FUNKCJE KOMUNIKACJI ===========
 def send_bits(bits):
     print("Wysyłanie ramki Hamminga")
-    irq_state = machine.disable_irq()   # wyłącz przerwania na czas nadawania
+    irq_state = machine.disable_irq()
     try:
         for bit in bits:
             tx.value(1 if bit == '1' else 0)
@@ -101,52 +94,67 @@ def send_bits(bits):
         tx.value(0)
         machine.enable_irq(irq_state)
 
-def wait_for_preamble(timeout_ms=1000):
+def wait_for_preamble_with_sync(timeout_ms=3000):
     start_time = utime.ticks_ms()
     bit_count = 0
+    last_state = rx.value()
+    last_edge = utime.ticks_us()
+    first_edge_time = 0
+    last_edge_time = 0
     
     while utime.ticks_diff(utime.ticks_ms(), start_time) < timeout_ms:
-        last_state = rx.value()
-        edge_time = utime.ticks_us()
+        current_state = rx.value()
         
-        while rx.value() == last_state:
-            if utime.ticks_diff(utime.ticks_us(), edge_time) > BIT_LEN_US * 2:
-                bit_count = 0
-                break
+        if current_state != last_state:
+            now = utime.ticks_us()
+            pulse_width = utime.ticks_diff(now, last_edge)
+            
+            if pulse_width > BIT_LEN_US * 0.6 and pulse_width < BIT_LEN_US * 1.4:
+                target_time = now + (pulse_width // 2)
+                while utime.ticks_diff(target_time, utime.ticks_us()) > 0:
+                    pass
+                
+                sampled_bit = rx.value()
+                expected_bit = PREAMBLE[bit_count]
+                
+                if (expected_bit == '1' and sampled_bit == 1) or (expected_bit == '0' and sampled_bit == 0):
+                    if bit_count == 0:
+                        first_edge_time = now
+                    bit_count += 1
+                    last_edge_time = now
+                    
+                    if bit_count == PREAMBLE_LEN:
+                        measured_bit_len = (last_edge_time - first_edge_time) // (PREAMBLE_LEN - 1)
+                        print(f"Zmierzony czas bitu: {measured_bit_len}")
+                        return True, measured_bit_len, last_edge_time
+                else:
+                    bit_count = 0
+            
+            last_edge = now
+            last_state = current_state
         
-        if utime.ticks_diff(utime.ticks_us(), edge_time) > BIT_LEN_US * 2:
-            continue
-        
-        # Ujednolicone timingi - 0.5 bitu do środka
-        utime.sleep_us(int(BIT_LEN_US * 0.5))
-        current_bit = rx.value()
-        expected_bit = PREAMBLE[bit_count]
-        
-        if (expected_bit == '1' and current_bit == 1) or (expected_bit == '0' and current_bit == 0):
-            bit_count += 1
-            if bit_count == PREAMBLE_LEN:
-                return True
-        else:
+        if utime.ticks_diff(utime.ticks_us(), last_edge) > BIT_LEN_US * 3:
             bit_count = 0
+            last_state = rx.value()
+            last_edge = utime.ticks_us()
     
-    return False
+    return False, BIT_LEN_US, 0
 
-def read_frame_after_preamble():
+def read_frame_with_sync(bit_duration, preamble_end_time):
     frame = ""
     bits_to_read = HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN
     
-    # Ujednolicone timingi - czekaj 0.5 bitu do środka pierwszego bitu
-    target_time = utime.ticks_us() + int(BIT_LEN_US * 0.5)
-    while utime.ticks_diff(target_time, utime.ticks_us()) > 0:
+    # Poczekaj do środka pierwszego bitu danych
+    first_bit_center = preamble_end_time + bit_duration + (bit_duration // 2)
+    while utime.ticks_diff(first_bit_center, utime.ticks_us()) > 0:
         pass
     
     for i in range(bits_to_read):
         frame += '1' if rx.value() else '0'
         
-        # Czekaj pełny okres bitu przed następnym odczytem
         if i < bits_to_read - 1:
-            target_time = utime.ticks_us() + BIT_LEN_US
-            while utime.ticks_diff(target_time, utime.ticks_us()) > 0:
+            next_bit_center = utime.ticks_us() + bit_duration
+            while utime.ticks_diff(next_bit_center, utime.ticks_us()) > 0:
                 pass
     
     return frame
@@ -167,7 +175,6 @@ def verify_frame(frame):
     return verify_hamming(data, parity)
 
 # =========== GŁÓWNA PĘTLA ===========
-
 print("=== Raspberry Pi Pico TX/RX ready (Hamming) ===")
 retransmission_count = 0
 sequence_number = 0
@@ -177,18 +184,19 @@ while True:
     
     print("\n=== PRÓBA WYSŁANIA RAMKI HAMMINGA ===")
     
-    # KROK 1: Przygotuj i wyślij ramkę danych z Hammingiem
+    # KROK 1: Przygotuj i wyślij ramkę danych
     frame_to_send = build_data_frame(sequence_number)
     print(f"Wysyłana ramka: {frame_to_send}")
     send_bits(frame_to_send)
     
-    # KROK 2: Czekaj na ACK
+    # KROK 2: Czekaj na ACK z synchronizacją
     print("Oczekiwanie na ACK...")
     ack_wait_start = utime.ticks_ms()
     
     while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
-        if wait_for_preamble(ACK_TIMEOUT_MS):
-            ack_frame = read_frame_after_preamble()
+        found, bit_duration, preamble_end = wait_for_preamble_with_sync(ACK_TIMEOUT_MS)
+        if found:
+            ack_frame = read_frame_with_sync(bit_duration, preamble_end)
             print(f"Odebrana ramka ACK ({len(ack_frame)} bitów): {ack_frame}")
             
             if verify_frame(ack_frame):
