@@ -150,6 +150,19 @@ bool verify_frame(const String &frame) {
   return verify_hamming(data, parity);
 }
 
+// --- Dodawanie losowych bledow ---
+String introduce_random_errors(const String &frame, float error_probability = 0.1) {
+  String corrupted = frame;
+
+  for (int i = PREAMBLE_LEN; i < corrupted.length(); i++) {
+    if (((float)random(0, 1000) / 1000.0) < error_probability) {
+      corrupted[i] = (corrupted[i] == '1') ? '0' : '1';
+}
+}
+
+return corrupted;
+}
+
 // --- Setup i loop ---
 void setup() {
   Serial.begin(115200);
@@ -166,6 +179,7 @@ void loop() {
     Serial.println("✅ Preambuła znaleziona!");
 
     String frame = read_frame_after_preamble();
+    frame = introduce_random_errors(frame, 0.033);
     Serial.print("Odebrana ramka (");
     Serial.print(frame.length());
     Serial.print(" bitów): ");
@@ -180,7 +194,7 @@ void loop() {
       Serial.println("ACK wysłany");
     } else {
       Serial.println("❌ BŁĄD RAMKI - wysyłam NACK");
-      delay(50);
+      delay(100);
       send_bits(build_nack_frame());
       Serial.println("NACK wysłany");
     }

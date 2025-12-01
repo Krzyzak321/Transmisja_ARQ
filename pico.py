@@ -12,7 +12,7 @@ PREAMBLE_LEN = 16
 HEADER_LEN = 12           # 4 typ + 4 sekw + 3 długość + 1 rezerwa
 DATA_BITS_LEN = 26        # 26 bitów danych
 HAMMING_PARITY_LEN = 5    # 5 bitów parzystości Hamminga
-# długość ramki bez preambuły (to co czytamy po preambule)
+# długość ramki bez preambuły
 BITS_AFTER_PREAMBLE = HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN
 
 PREAMBLE = "1010101010101010"
@@ -57,7 +57,7 @@ def calculate_hamming_parity(data):
 
 def verify_hamming(data, parity):
     calculated_parity = calculate_hamming_parity(data)
-    print(f"Hamming - Odebrane dane: {data}, Odebrana parzystość: {parity}, Obliczona parzystość: {calculated_parity}")
+    # print(f"Hamming - Odebrane dane: {data}, Odebrana parzystość: {parity}, Obliczona parzystość: {calculated_parity}")
     return calculated_parity == parity
 
 # =========== FUNKCJE BUDOWANIA RAMEK ===========
@@ -184,14 +184,14 @@ sequence_number = 0
 while True:
     ack_received = False
 
-    print("\n=== PRÓBA WYSŁANIA RAMKI HAMMINGA ===")
+    print("\n=== PRÓBA WYSŁANIA RAMKI  ===")
     # KROK 1: Przygotuj i wyślij ramkę danych z Hammingiem
     frame_to_send = build_data_frame(sequence_number)
     print(f"Wysyłana ramka: {frame_to_send}")
     send_bits(frame_to_send)
 
     # KROK 2: Czekaj na ACK
-    print("Oczekiwanie na ACK...")
+    print("\n=== Oczekiwanie na ACK ===")
     ack_wait_start = utime.ticks_ms()
 
     while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
@@ -202,7 +202,7 @@ while True:
 
         # mamy timestamp końca preambuły -> czytaj ramkę względem tego czasu
         ack_frame = read_frame_after_preamble(preamble_time)
-        print(f"Odebrana ramka ACK ({len(ack_frame)} bitów): {ack_frame}")
+        print(f"Odebrana ramka ACK ({len(ack_frame)} bit): {ack_frame}")
 
         if verify_frame(ack_frame):
             header = ack_frame[:HEADER_LEN]
