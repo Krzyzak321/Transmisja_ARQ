@@ -1,214 +1,237 @@
 from machine import Pin
 import utime
+import machine
 
 # =========== KONFIGURACJA SYSTEMU ===========
-# Definicja pinów do komunikacji
-TX_PIN = 15              # Pin do wysyłania danych (Transmit)
-RX_PIN = 21              # Pin do odbierania danych (Receive)
+TX_PIN = 15
+RX_PIN = 21
+BIT_LEN_US = 990
 
-# Konfiguracja czasowa i struktury ramki
-BIT_LEN_US = 1000         # Czas trwania jednego bitu w mikrosekundach
-PREAMBLE_LEN = 16        # Długość preambuły synchronizacyjnej
-DATA_BITS_LEN = 32        # Długość danych w bitach
-TOTAL_BITS_LEN = PREAMBLE_LEN + DATA_BITS_LEN + 1  # Całkowita długość ramki
+# --- Nowe stałe dla Hamminga ---
+PREAMBLE_LEN = 16
+HEADER_LEN = 12           # 4 typ + 4 sekw + 3 długość + 1 rezerwa
+DATA_BITS_LEN = 26        # 26 bitów danych
+HAMMING_PARITY_LEN = 5    # 5 bitów parzystości Hamminga
+# długość ramki bez preambuły (to co czytamy po preambule)
+BITS_AFTER_PREAMBLE = HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN
 
-# Definicja stałych sygnałów
-PREAMBLE = "1010101010101010"  # Sygnał synchronizujący - pomaga odbiorcy zsynchronizować się z nadajnikiem
-DATA_BITS = "11100010111000101110001011100010";       # Dane które chcemy przesłać
-ACK_SIGNAL = "11111111111111111111111111111111";       # Potwierdzenie poprawnego odbioru (ACKnowledge)
-NACK_SIGNAL = "00000000000000000000000000000000";       # Sygnał błędu (Negative ACKnowledge)
+PREAMBLE = "1010101010101010"
 
-# Konfiguracja protokołu komunikacyjnego
-ACK_TIMEOUT_MS = 1000          # Czas oczekiwania na potwierdzenie
-MAX_RETRANSMISSIONS = 1000        # Maksymalna liczba ponownych wysłań przy braku potwierdzenia
+# --- Typy ramek ---
+FRAME_TYPE_DATA = "0001"
+FRAME_TYPE_ACK = "0010"
+FRAME_TYPE_NACK = "0011"
+FRAME_TYPE_SREJ = "0100"
 
-# Inicjalizacja pinów
-tx = Pin(TX_PIN, Pin.OUT)      # Ustaw pin TX jako wyjście
-rx = Pin(RX_PIN, Pin.IN)       # Ustaw pin RX jako wejście
-tx.value(0)                    # Upewnij się że nadajnik jest wyłączony na starcie
+# --- Sygnały ACK/NACK ---
+ACK_DATA = "1" * DATA_BITS_LEN
+NACK_DATA = "0" * DATA_BITS_LEN
 
-# =========== FUNKCJE POMOCNICZE ===========
+# --- Dane testowe ---
+DATA_BITS = "11001100110011001100110001"  # 26 bitów danych
 
-def calculate_parity(data):
-    """
-    Oblicza bit parzystości dla danych
-    Bit parzystości to dodatkowy bit dodawany do danych, który pozwala wykryć błędy
-    Zasada: jeśli liczba jedynek w danych jest parzysta, bit parzystości = 0, w przeciwnym razie = 1
-    """
-    count = 0  # Licznik jedynek
-    for bit in data:
-        if bit == '1':
-            count += 1  # Zliczamy wszystkie jedynki w danych
-    
-    # Jeśli liczba jedynek jest parzysta, zwracamy '0', w przeciwnym razie '1'
-    return '0' if count % 2 == 0 else '1'
+# --- Konfiguracja protokołu ---
+ACK_TIMEOUT_MS = 1000
+MAX_RETRANSMISSIONS = 1000
 
-def build_frame():
-    """
-    Buduje kompletną ramkę danych do wysłania
-    Ramka składa się z: PREAMBUŁA + DANE + BIT_PARZYSTOŚCI
-    """
-    parity = calculate_parity(DATA_BITS)  # Oblicz bit parzystości dla danych
-    return PREAMBLE + DATA_BITS + parity  # Połącz wszystkie części w ramkę
+# --- Inicjalizacja pinów ---
+tx = Pin(TX_PIN, Pin.OUT)
+rx = Pin(RX_PIN, Pin.IN)
+tx.value(0)
 
-def build_ack_frame():
-    """Buduje ramkę potwierdzenia (ACK) - informuje nadajnik, że dane dotarły poprawnie"""
-    return PREAMBLE + ACK_SIGNAL + calculate_parity(ACK_SIGNAL)
+# =========== FUNKCJE HAMMINGA (31,26) ===========
+def calculate_hamming_parity(data):
+    data_positions = [3,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+    word = [0] * 32
+    for i in range(26):
+        pos = data_positions[i]
+        word[pos] = 1 if data[i] == '1' else 0
+    p1 = p2 = p4 = p8 = p16 = 0
+    for j in range(1, 32):
+        if j & 1: p1 ^= word[j]
+        if j & 2: p2 ^= word[j]
+        if j & 4: p4 ^= word[j]
+        if j & 8: p8 ^= word[j]
+        if j & 16: p16 ^= word[j]
+    return str(p1) + str(p2) + str(p4) + str(p8) + str(p16)
 
-def build_nack_frame():
-    """Buduje ramkę braku potwierdzenia (NACK) - informuje nadajnik o błędzie w danych"""
-    return PREAMBLE + NACK_SIGNAL + calculate_parity(NACK_SIGNAL)
+def verify_hamming(data, parity):
+    calculated_parity = calculate_hamming_parity(data)
+    print(f"Hamming - Odebrane dane: {data}, Odebrana parzystość: {parity}, Obliczona parzystość: {calculated_parity}")
+    return calculated_parity == parity
 
+# =========== FUNKCJE BUDOWANIA RAMEK ===========
+def build_data_frame(seq_num=0):
+    seq_bits = f"{seq_num:04b}"
+    header = FRAME_TYPE_DATA + seq_bits + "1100"
+    parity = calculate_hamming_parity(DATA_BITS)
+    print(f"Wysyłane dane: {DATA_BITS}, Wysyłana parzystość: {parity}")
+    return PREAMBLE + header + DATA_BITS + parity
+
+def build_ack_frame(seq_num=0):
+    seq_bits = f"{seq_num:04b}"
+    header = FRAME_TYPE_ACK + seq_bits + "1100"
+    parity = calculate_hamming_parity(ACK_DATA)
+    return PREAMBLE + header + ACK_DATA + parity
+
+def build_nack_frame(seq_num=0):
+    seq_bits = f"{seq_num:04b}"
+    header = FRAME_TYPE_NACK + seq_bits + "1100"
+    parity = calculate_hamming_parity(NACK_DATA)
+    return PREAMBLE + header + NACK_DATA + parity
+
+# =========== POZOSTAŁE FUNKCJE (TIMING) ===========
 def send_bits(bits):
-    """
-    Wysyła ciąg bitów przez pin TX
-    Każdy bit jest ustawiany na pinie na określony czas (BIT_LEN_US)
-    Technika ta nazywa się modulacją OOK (On-Off Keying)
-    """
-    print("Wysyłanie:", bits)
-    
-    # Dla każdego bitu w ciągu...
-    for bit in bits:
-        # Ustaw stan wysoki jeśli bit = '1', niski jeśli bit = '0'
-        tx.value(1 if bit == '1' else 0)
-        # Czekaj przez czas trwania jednego bitu
-        utime.sleep_us(BIT_LEN_US)
-    
-    # Po wysłaniu wszystkich bitów ustaw pin w stan niski (bezczynność)
-    tx.value(0)
+    # wyłącz przerwania na czas nadawania -> stabilność timingu
+    irq_state = machine.disable_irq()
+    try:
+        for bit in bits:
+            tx.value(1 if bit == '1' else 0)
+            utime.sleep_us(BIT_LEN_US)
+    finally:
+        tx.value(0)
+        machine.enable_irq(irq_state)
 
+# WAIT FOR PREAMBLE: zwraca timestamp (us) ostatniej krawędzi preambuły lub None
 def wait_for_preamble(timeout_ms=1000):
-    """
-    Nasłuchuje na preambułę - czeka na sygnał synchronizujący od odbiorcy
-    Preambuła to znany wzór bitów który pomaga zsynchronizować się z nadawcą
-    """
-    start_time = utime.ticks_ms()  # Zapamiętaj czas rozpoczęcia nasłuchiwania
-    bit_count = 0                  # Licznik poprawnie odebranych bitów preambuły
-    
-    # Nasłuchuj przez określony czas (timeout)
-    while utime.ticks_diff(utime.ticks_ms(), start_time) < timeout_ms:
-        last_state = rx.value()  # Zapamiętaj aktualny stan pinu
-        edge_time = utime.ticks_us()  # Czas kiedy zaczęliśmy czekać na zmianę
-        
-        # Czekaj na zmianę stanu pinu (zbocze sygnału)
-        while rx.value() == last_state:
-            # Jeśli czekamy zbyt długo bez zmiany, przerwij i zacznij od nowa
-            if utime.ticks_diff(utime.ticks_us(), edge_time) > BIT_LEN_US * 2:
-                bit_count = 0
-                break
-        
-        # Jeśli nie było zmiany w odpowiednim czasie, kontynuuj nasłuchiwanie
-        if utime.ticks_diff(utime.ticks_us(), edge_time) > BIT_LEN_US * 2:
-            continue
-        
-        # Poczekaj do środka czasu trwania bitu (dla lepszej synchronizacji)
-        utime.sleep_us(int(BIT_LEN_US * 0.7))
-        # Odczytaj aktualną wartość bitu
-        current_bit = rx.value()
-        
-        # Sprawdź czy odebrany bit zgadza się z oczekiwanym bitem preambuły
-        expected_bit = PREAMBLE[bit_count]
-        if (expected_bit == '1' and current_bit == 1) or (expected_bit == '0' and current_bit == 0):
-            bit_count += 1  # Bit się zgadza - zwiększ licznik
-            # Jeśli odebrano całą preambułę, zwróć sukces
-            if bit_count == PREAMBLE_LEN:
-                return True
-        else:
-            bit_count = 0  # Bit się nie zgadza - zacznij szukać preambuły od nowa
-    
-    return False  # Timeout - nie znaleziono preambuły w określonym czasie
+    start_time = utime.ticks_ms()
+    bit_count = 0
+    last_state = rx.value()
+    last_edge = utime.ticks_us()
 
-def read_frame_after_preamble():
-    """
-    Odczytuje ramkę danych PO tym jak została już wykryta preambuła
-    Zakładamy, że jesteśmy zsynchronizowani z nadajnikiem
-    """
-    frame = ""  # Bufor na odebrane bity
-    
-    # Odczytaj określoną liczbę bitów (dane + bit parzystości)
-    for i in range(DATA_BITS_LEN + 1):
-        utime.sleep_us(int(BIT_LEN_US*0.8))
-        frame += '1' if rx.value() else '0'  # Odczytaj bit i dodaj do ramki
-                # Poczekaj do następnego bitu
+    while utime.ticks_diff(utime.ticks_ms(), start_time) < timeout_ms:
+        current = rx.value()
+        if current != last_state:
+            now = utime.ticks_us()
+            pulse_width = utime.ticks_diff(now, last_edge)
+            # jeśli pulse_width wygląda sensownie (około jednego BIT_LEN_US), próbkuj w połowie impulsu
+            # (próbkujemy od krawędzi poprzedniej, by trafić w środek)
+            if pulse_width > BIT_LEN_US * 0.4 and pulse_width < BIT_LEN_US * 1.6:
+                sample_time = utime.ticks_add(last_edge, pulse_width // 2)
+                # czekaj do sample_time
+                while utime.ticks_diff(sample_time, utime.ticks_us()) > 0:
+                    pass
+                sampled = rx.value()
+                expected = PREAMBLE[bit_count]
+                if (expected == '1' and sampled == 1) or (expected == '0' and sampled == 0):
+                    bit_count += 1
+                    if bit_count == PREAMBLE_LEN:
+                        # zwróć czas tej ostatniej krawędzi (koniec preambuły)
+                        return now
+                else:
+                    bit_count = 0
+            else:
+                # jeśli impuls był zbyt krótki/długi, zresetuj i kontynuuj
+                bit_count = 0
+
+            last_edge = now
+            last_state = current
+
+        # jeśli nie ma żadnych krawędzi przez długo > 3 bitów, zresetuj licznik
+        if utime.ticks_diff(utime.ticks_us(), last_edge) > BIT_LEN_US * 3:
+            bit_count = 0
+            last_state = rx.value()
+            last_edge = utime.ticks_us()
+
+    return None
+
+# READ FRAME AFTER PREAMBLE: wyrównane próbkowanie od preamble_ts
+def read_frame_after_preamble(preamble_ts):
+    frame = ""
+    bits_to_read = BITS_AFTER_PREAMBLE
+
+    # pierwszy bit nagłówka zaczyna się 1*BIT_LEN_US po końcu preambuły
+    first_sample = utime.ticks_add(preamble_ts, BIT_LEN_US)
+    # przesunięcie do środka bitu
+    first_sample = utime.ticks_add(first_sample, int(BIT_LEN_US * 0.5))
+
+    # czekaj do pierwszego sample
+    while utime.ticks_diff(first_sample, utime.ticks_us()) > 0:
+        pass
+
+    t = first_sample
+    for i in range(bits_to_read):
+        frame += '1' if rx.value() else '0'
+        # przygotuj następny czas próbkowania
+        t = utime.ticks_add(t, BIT_LEN_US)
+        # czekaj do czasu
+        if i < bits_to_read - 1:
+            while utime.ticks_diff(t, utime.ticks_us()) > 0:
+                pass
 
     return frame
 
 def verify_frame(frame):
-    """
-    Sprawdza poprawność odebranej ramki
-    Weryfikuje bit parzystości i długość ramki
-    """
-    # Sprawdź czy ramka ma oczekiwaną długość
-    if len(frame) != DATA_BITS_LEN + 1:
+    if len(frame) != HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN:
+        print(f"❌ Błędna długość ramki: {len(frame)}, oczekiwano: {HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN}")
         return False
-    
-    # Podziel ramkę na dane i bit parzystości
-    data = frame[:DATA_BITS_LEN]
-    received_parity = frame[DATA_BITS_LEN:]
-    
-    # Oblicz jaki powinien być bit parzystości dla odebranych danych
-    calculated_parity = calculate_parity(data)
-    
-    # Porównaj obliczony bit parzystości z odebranym
-    return received_parity == calculated_parity
 
-# =========== GŁÓWNA PĘTLA PROGRAMU ===========
+    header = frame[:HEADER_LEN]
+    data = frame[HEADER_LEN:HEADER_LEN + DATA_BITS_LEN]
+    parity = frame[HEADER_LEN + DATA_BITS_LEN:]
 
-print("=== Raspberry Pi Pico TX/RX ready ===")
-retransmission_count = 0  # Licznik ponownych wysłań
+    print(f"Odebrany nagłówek: {header}")
+    print(f"Odebrane dane: {data}")
+    print(f"Odebrana parzystość: {parity}")
+
+    return verify_hamming(data, parity)
+
+# =========== GŁÓWNA PĘTLA ===========
+print("=== Raspberry Pi Pico TX/RX ready (Hamming) ===")
+retransmission_count = 0
+sequence_number = 0
 
 while True:
-    ack_received = False  # Flaga czy otrzymaliśmy potwierdzenie
-    
-    print("\n=== PRÓBA WYSŁANIA RAMKI ===")
-    
-    # KROK 1: Przygotuj i wyślij ramkę danych
-    frame_to_send = build_frame()   # Zbuduj ramkę z danymi
-    #print("Wysyłam ramkę:", frame_to_send)
-    send_bits(frame_to_send)        # Wyślij ramkę przez radio
-    
-    # KROK 2: Przejdź w tryb odbioru i czekaj na potwierdzenie (ACK)
-    print("\n=== Oczekiwanie na ACK ===")
-    #print("Oczekiwanie na ACK...")
-    ack_wait_start = utime.ticks_ms()  # Zapamiętaj czas rozpoczęcia oczekiwania
-    
-    # Czekaj na ACK przez określony czas (ACK_TIMEOUT_MS)
+    ack_received = False
+
+    print("\n=== PRÓBA WYSŁANIA RAMKI HAMMINGA ===")
+    # KROK 1: Przygotuj i wyślij ramkę danych z Hammingiem
+    frame_to_send = build_data_frame(sequence_number)
+    print(f"Wysyłana ramka: {frame_to_send}")
+    send_bits(frame_to_send)
+
+    # KROK 2: Czekaj na ACK
+    print("Oczekiwanie na ACK...")
+    ack_wait_start = utime.ticks_ms()
+
     while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
-        # Sprawdź czy nadchodzi preambuła (czy odbiorca odpowiada)
-        if wait_for_preamble(ACK_TIMEOUT_MS):
-            # Odbierz ramkę odpowiedzi
-            ack_data = read_frame_after_preamble()
-            print("Odebrana odpowiedź:", ack_data)
-            
-            # Sprawdź co to za odpowiedź
-            data = ack_data[:DATA_BITS_LEN]
-            if data == ACK_SIGNAL:
-                # Otrzymaliśmy potwierdzenie - transmisja się udała!
+        preamble_time = wait_for_preamble(ACK_TIMEOUT_MS)
+        if preamble_time is None:
+            # brak preambuły w tym okresie - kontynuuj oczekiwanie
+            continue
+
+        # mamy timestamp końca preambuły -> czytaj ramkę względem tego czasu
+        ack_frame = read_frame_after_preamble(preamble_time)
+        print(f"Odebrana ramka ACK ({len(ack_frame)} bitów): {ack_frame}")
+
+        if verify_frame(ack_frame):
+            header = ack_frame[:HEADER_LEN]
+            frame_type = header[:4]
+
+            if frame_type == FRAME_TYPE_ACK:
                 print("✅ Otrzymano ACK - transmisja udana!")
                 ack_received = True
-                retransmission_count = 0  # Zresetuj licznik ponownych wysłań
-                break  # Wyjdź z pętli oczekiwania
-            elif data == NACK_SIGNAL:
-                # Otrzymaliśmy informację o błędzie
+                retransmission_count = 0
+                sequence_number = (sequence_number + 1) % 16
+                break
+            elif frame_type == FRAME_TYPE_NACK:
                 print("❌ Otrzymano NACK - błąd transmisji")
-                break  # Wyjdź z pętli oczekiwania
-            else:
-                # Otrzymaliśmy nieznany sygnał
-                print("❓ Odebrano nieznany sygnał")
-    
-    # KROK 3: Obsłuż sytuację gdy nie otrzymano potwierdzenia
+                break
+        else:
+            print("❓ Odebrano nieznany sygnał / ramka z błędem")
+
+    # KROK 3: Obsłuż brak potwierdzenia
     if not ack_received:
         print("⏰ Timeout ACK - brak odpowiedzi")
-        retransmission_count += 1  # Zwiększ licznik ponownych wysłań
-        
-        # Sprawdź czy nie przekroczono maksymalnej liczby ponownych wysłań
+        retransmission_count += 1
+
         if retransmission_count >= MAX_RETRANSMISSIONS:
             print("🛑 Przekroczono maksymalną liczbę retransmisji")
-            retransmission_count = 0  # Zresetuj licznik
+            retransmission_count = 0
+            sequence_number = (sequence_number + 1) % 16
         else:
-            # Jeszcze możemy próbować ponownie
             print("🔄 Retransmisja #" + str(retransmission_count))
-            # UWAGA: Tutaj nie ma delay(), więc retransmisja nastąpi natychmiast w następnym obiegu pętli
-    
-    # KROK 4: Zrób przerwę przed następną próbą komunikacji
-    utime.sleep_ms(2000)  # Czekaj 2 sekundy przed następną transmisją
+
+    # KROK 4: Przerwa przed następną transmisją
+    utime.sleep_ms(2000)
+
