@@ -11,11 +11,16 @@ BIT_LEN_US = 990
 PREAMBLE_LEN = 16
 HEADER_LEN = 12           # 4 typ + 4 sekw + 3 długość + 1 rezerwa
 DATA_BITS_LEN = 26        # 26 bitów danych
+CRC_PARITY_LEN = 4
 HAMMING_PARITY_LEN = 5    # 5 bitów parzystości Hamminga
 # długość ramki bez preambuły
 BITS_AFTER_PREAMBLE = HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN
 
 PREAMBLE = "1010101010101010"
+
+# Tryby
+MODE_HAMMING = 0
+MODE_CRC4 = 1
 
 # --- Typy ramek ---
 FRAME_TYPE_DATA = "0001"
@@ -39,6 +44,34 @@ tx = Pin(TX_PIN, Pin.OUT)
 rx = Pin(RX_PIN, Pin.IN)
 tx.value(0)
 
+# =========== FUNKCJE CRC-4 ===========
+# polynomial: x^4 + x + 1 -> 0b0011 (0x3) (bez bitu x^4 w reprezentacji reszty)
+def calculate_crc4(data_bits):
+    # data_bits: string "0"/"1", MSB first
+    # perform binary long division, return 4-bit string
+    poly = 0x3  # reprezentacja bez najwyższego bitu (x^4)
+    # build integer from bits, shift left by 4 (space for CRC)
+    value = 0
+    for b in data_bits:
+        value = (value << 1) | (1 if b == '1' else 0)
+    value <<= CRC_PARITY_LEN
+    # degree of poly is 4, so mask for top bit is 1 << (len(data)+4-1) ... we iterate
+    total_len = len(data_bits) + CRC_PARITY_LEN
+    for i in range(len(data_bits)):
+        # check bit at position (total_len - 1 - i)
+        shift = total_len - 1 - i
+        if (value >> shift) & 1:
+            # XOR poly shifted to align with current top
+            value ^= (poly << (shift - CRC_PARITY_LEN))
+    # remainder is lower 4 bits
+    rem = value & ((1 << CRC_PARITY_LEN) - 1)
+    return f"{rem:04b}"
+
+def verify_crc4(data_bits, crc_bits):
+    calculated = calculate_crc4(data_bits)
+    # print(f"CRC calc {calculated} vs recv {crc_bits}")
+    return calculated == crc_bits
+
 # =========== FUNKCJE HAMMINGA (31,26) ===========
 def calculate_hamming_parity(data):
     data_positions = [3,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
@@ -61,25 +94,33 @@ def verify_hamming(data, parity):
     return calculated_parity == parity
 
 # =========== FUNKCJE BUDOWANIA RAMEK ===========
-def build_data_frame(seq_num=0):
+def build_data_frame(seq_num=0, mode=MODE_HAMMING):
     seq_bits = f"{seq_num:04b}"
-    header = FRAME_TYPE_DATA + seq_bits + "1100"
-    parity = calculate_hamming_parity(DATA_BITS)
-    print(f"Wysyłane dane: {DATA_BITS}, Wysyłana parzystość: {parity}")
+    mode_flag = '1' if mode == MODE_CRC4 else '0'
+    # nagłówek: typ(4) + seq(4) + długość(3) + tryb(1)
+    header = FRAME_TYPE_DATA + seq_bits + "110" + mode_flag
+    if mode == MODE_HAMMING:
+        parity = calculate_hamming_parity(DATA_BITS)
+    else:
+        parity = calculate_crc4(DATA_BITS)
+    print(f"Wysyłane dane: {DATA_BITS}, Parzystość ({'CRC4' if mode==MODE_CRC4 else 'Hamming'}): {parity}")
     return PREAMBLE + header + DATA_BITS + parity
 
-def build_ack_frame(seq_num=0):
+def build_ack_frame(seq_num=0, mode=MODE_HAMMING):
     seq_bits = f"{seq_num:04b}"
-    header = FRAME_TYPE_ACK + seq_bits + "1100"
-    parity = calculate_hamming_parity(ACK_DATA)
-    return PREAMBLE + header + ACK_DATA + parity
+    mode_flag = '1' if mode == MODE_CRC4 else '0'
+    header = FRAME_TYPE_ACK + seq_bits + "110" + mode_flag
+    data = ACK_DATA
+    parity = calculate_crc4(data) if mode==MODE_CRC4 else calculate_hamming_parity(data)
+    return PREAMBLE + header + data + parity
 
-def build_nack_frame(seq_num=0):
+def build_nack_frame(seq_num=0, mode=MODE_HAMMING):
     seq_bits = f"{seq_num:04b}"
-    header = FRAME_TYPE_NACK + seq_bits + "1100"
-    parity = calculate_hamming_parity(NACK_DATA)
-    return PREAMBLE + header + NACK_DATA + parity
-
+    mode_flag = '1' if mode == MODE_CRC4 else '0'
+    header = FRAME_TYPE_NACK + seq_bits + "110" + mode_flag
+    data = NACK_DATA
+    parity = calculate_crc4(data) if mode==MODE_CRC4 else calculate_hamming_parity(data)
+    return PREAMBLE + header + data + parity
 # =========== POZOSTAŁE FUNKCJE (TIMING) ===========
 def send_bits(bits):
     # wyłącz przerwania na czas nadawania -> stabilność timingu
@@ -137,50 +178,69 @@ def wait_for_preamble(timeout_ms=1000):
 
 # READ FRAME AFTER PREAMBLE: wyrównane próbkowanie od preamble_ts
 def read_frame_after_preamble(preamble_ts):
-    frame = ""
-    bits_to_read = BITS_AFTER_PREAMBLE
-
-    # pierwszy bit nagłówka zaczyna się 1*BIT_LEN_US po końcu preambuły
+    # najpierw wczytaj HEADER_LEN bitów (wyrównane tak jak wcześniej)
+    frame_header = ""
+    # first sample same jak wcześniej
     first_sample = utime.ticks_add(preamble_ts, BIT_LEN_US)
-    # przesunięcie do środka bitu
     first_sample = utime.ticks_add(first_sample, int(BIT_LEN_US * 0.5))
-
-    # czekaj do pierwszego sample
     while utime.ticks_diff(first_sample, utime.ticks_us()) > 0:
         pass
-
     t = first_sample
-    for i in range(bits_to_read):
-        frame += '1' if rx.value() else '0'
-        # przygotuj następny czas próbkowania
+    for i in range(HEADER_LEN):
+        frame_header += '1' if rx.value() else '0'
         t = utime.ticks_add(t, BIT_LEN_US)
-        # czekaj do czasu
-        if i < bits_to_read - 1:
+        if i < HEADER_LEN - 1:
             while utime.ticks_diff(t, utime.ticks_us()) > 0:
                 pass
 
-    return frame
+    # odczytaj tryb z ostatniego bitu nagłówka
+    mode_flag = frame_header[-1]
+    parity_len = CRC_PARITY_LEN if mode_flag == '1' else HAMMING_PARITY_LEN
+
+    # teraz wczytaj DATA_BITS_LEN + parity_len
+    rest = ""
+    # już ustawiony czas t = first_sample + HEADER_LEN * BIT_LEN_US
+    for i in range(DATA_BITS_LEN + parity_len):
+        rest += '1' if rx.value() else '0'
+        t = utime.ticks_add(t, BIT_LEN_US)
+        if i < DATA_BITS_LEN + parity_len - 1:
+            while utime.ticks_diff(t, utime.ticks_us()) > 0:
+                pass
+
+    return frame_header + rest
 
 def verify_frame(frame):
-    if len(frame) != HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN:
-        print(f"❌ Błędna długość ramki: {len(frame)}, oczekiwano: {HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN}")
+    # minimalna długość header+data+4 = 12+26+4 = 42 albo +5 = 43
+    if len(frame) < HEADER_LEN + DATA_BITS_LEN + CRC_PARITY_LEN:
+        print(f"❌ Zbyt krótka ramka: {len(frame)}")
         return False
 
     header = frame[:HEADER_LEN]
+    mode_flag = header[-1]
+    parity_len = CRC_PARITY_LEN if mode_flag == '1' else HAMMING_PARITY_LEN
+
+    expected_len = HEADER_LEN + DATA_BITS_LEN + parity_len
+    if len(frame) != expected_len:
+        print(f"❌ Błędna długość ramki: {len(frame)}, oczekiwano: {expected_len}")
+        return False
+
     data = frame[HEADER_LEN:HEADER_LEN + DATA_BITS_LEN]
     parity = frame[HEADER_LEN + DATA_BITS_LEN:]
 
-    print(f"Odebrany nagłówek: {header}")
+    print(f"Odebrany nagłówek: {header} (mode_flag={mode_flag})")
     print(f"Odebrane dane: {data}")
     print(f"Odebrana parzystość: {parity}")
 
-    return verify_hamming(data, parity)
+    if mode_flag == '1':  # CRC4
+        return verify_crc4(data, parity)
+    else:
+        return verify_hamming(data, parity)
 
 # =========== GŁÓWNA PĘTLA ===========
 print("=== Raspberry Pi Pico TX/RX ready (Hamming) ===")
 retransmission_count = 0
 sequence_number = 0
-
+CURRENT_MODE = MODE_CRC4 
 while True:
     ack_received = False
 
@@ -234,4 +294,5 @@ while True:
 
     # KROK 4: Przerwa przed następną transmisją
     utime.sleep_ms(2000)
+
 
