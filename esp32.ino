@@ -9,6 +9,10 @@ const unsigned long BIT_READ_DELAY_US = 1030;
 // --- Tryb korekcji błędów ---
 const bool USE_HAMMING = false; // true = Hamming (31,26), false = CRC-4
 
+// --- Tryb transmisji ---
+const bool USE_SELECTIVE_REPEAT = true; // true = Selective Repeat, false = Stop-and-Wait
+const int WINDOW_SIZE = 3; // Rozmiar okna
+
 // --- Stałe ramki ---
 const int PREAMBLE_LEN = 16;
 const int HEADER_LEN = 12;
@@ -16,7 +20,6 @@ const int DATA_BITS_LEN = 26;
 const int HAMMING_PARITY_LEN = 5;
 const int CRC_PARITY_LEN = 4;
 const int PARITY_LEN = USE_HAMMING ? HAMMING_PARITY_LEN : CRC_PARITY_LEN;
-const int TOTAL_FRAME_LEN = PREAMBLE_LEN + HEADER_LEN + DATA_BITS_LEN + PARITY_LEN;
 
 const String PREAMBLE = "1010101010101010";
 
@@ -24,7 +27,6 @@ const String PREAMBLE = "1010101010101010";
 const String FRAME_TYPE_DATA = "0001";
 const String FRAME_TYPE_ACK = "0010"; 
 const String FRAME_TYPE_NACK = "0011";
-const String FRAME_TYPE_SREJ = "0100";
 
 // --- Dane ACK/NACK ---
 const String ACK_DATA = "11111111111111111111111111";
@@ -120,13 +122,17 @@ bool verify_parity(const String &data, const String &parity) {
 }
 
 // --- Budowanie ramek ACK/NACK ---
-String build_ack_frame() {
-  String header = FRAME_TYPE_ACK + "0000" + "1100";
+String build_ack_frame(int seq_num) {
+  String seq_bits = String(seq_num, BIN);
+  while (seq_bits.length() < 4) seq_bits = "0" + seq_bits;
+  String header = FRAME_TYPE_ACK + seq_bits + "1100";
   return PREAMBLE + header + ACK_DATA + calculate_parity(ACK_DATA);
 }
 
-String build_nack_frame() {
-  String header = FRAME_TYPE_NACK + "0000" + "1100"; 
+String build_nack_frame(int seq_num) {
+  String seq_bits = String(seq_num, BIN);
+  while (seq_bits.length() < 4) seq_bits = "0" + seq_bits;
+  String header = FRAME_TYPE_NACK + seq_bits + "1100";
   return PREAMBLE + header + NACK_DATA + calculate_parity(NACK_DATA);
 }
 
@@ -198,7 +204,7 @@ String read_frame_after_preamble() {
 }
 
 // --- Weryfikacja ramki ---
-bool verify_frame(const String &frame) {
+bool verify_frame(const String &frame, int &seq_num) {
   if (frame.length() != HEADER_LEN + DATA_BITS_LEN + PARITY_LEN) {
     Serial.print("❌ Błędna długość ramki: "); Serial.println(frame.length());
     return false;
@@ -207,24 +213,17 @@ bool verify_frame(const String &frame) {
   String header = frame.substring(0, HEADER_LEN);
   String data = frame.substring(HEADER_LEN, HEADER_LEN + DATA_BITS_LEN);
   String parity = frame.substring(HEADER_LEN + DATA_BITS_LEN);
+  
+  // Wyodrębnij numer sekwencji
+  String seq_bits = header.substring(4, 8);
+  seq_num = strtol(seq_bits.c_str(), NULL, 2);
 
   Serial.print("Nagłówek: "); Serial.println(header);
   Serial.print("Dane: "); Serial.println(data);
   Serial.print("Parzystość: "); Serial.println(parity);
+  Serial.print("Numer sekwencji: "); Serial.println(seq_num);
 
   return verify_parity(data, parity);
-}
-
-// --- Dodawanie losowych bledow ---
-String introduce_random_errors(const String &frame, float error_probability = 0.1) {
-  String corrupted = frame;
-
-  for (int i = PREAMBLE_LEN; i < corrupted.length(); i++) {
-    if (((float)random(0, 1000) / 1000.0) < error_probability) {
-      corrupted[i] = (corrupted[i] == '1') ? '0' : '1';
-    }
-  }
-  return corrupted;
 }
 
 // --- Setup i loop ---
@@ -241,30 +240,32 @@ void setup() {
   } else {
     Serial.println("CRC-4 - 4 bity parzystości");
   }
+  Serial.print("Tryb transmisji: ");
+  if (USE_SELECTIVE_REPEAT) {
+    Serial.print("Selective Repeat (okno = "); Serial.print(WINDOW_SIZE); Serial.println(")");
+  } else {
+    Serial.println("Stop-and-Wait");
+  }
   Serial.print("Bitów parzystości: "); Serial.println(PARITY_LEN);
-  Serial.print("Długość ramki bez preambuły: "); Serial.println(HEADER_LEN + DATA_BITS_LEN + PARITY_LEN);
 }
 
 void loop() {
   if (wait_for_preamble()) {
-    Serial.println("✅ Preambuła znaleziona!");
+    Serial.println("\n✅ Preambuła znaleziona!");
 
     String frame = read_frame_after_preamble();
-    frame = introduce_random_errors(frame, 0.033);
-    Serial.print("Odebrana ramka (");
-    Serial.print(frame.length());
-    Serial.print(" bitów): ");
-    Serial.println(frame);
-
-    if (verify_frame(frame)) {
-      Serial.println("✅ RAMKA POPRAWNA - wysyłam ACK");
+    Serial.print("Odebrana ramka ("); Serial.print(frame.length()); Serial.println(" bitów)");
+    
+    int seq_num = 0;
+    if (verify_frame(frame, seq_num)) {
+      Serial.print("✅ RAMKA "); Serial.print(seq_num); Serial.println(" POPRAWNA - wysyłam ACK");
       delay(100);
-      send_bits(build_ack_frame());
+      send_bits(build_ack_frame(seq_num));
       Serial.println("ACK wysłany");
     } else {
-      Serial.println("❌ BŁĄD RAMKI - wysyłam NACK");
+      Serial.print("❌ BŁĄD RAMKI "); Serial.print(seq_num); Serial.println(" - wysyłam NACK");
       delay(100);
-      send_bits(build_nack_frame());
+      send_bits(build_nack_frame(seq_num));
       Serial.println("NACK wysłany");
     }
   }
