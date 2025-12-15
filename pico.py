@@ -7,13 +7,21 @@ TX_PIN = 15
 RX_PIN = 21
 BIT_LEN_US = 990
 
-# --- Nowe stałe dla Hamminga ---
+# --- Tryb korekcji błędów ---
+USE_HAMMING = False
+
+# --- Tryb transmisji ---
+USE_SELECTIVE_REPEAT = True  # True = Selective Repeat, False = Stop-and-Wait
+WINDOW_SIZE = 3  # Rozmiar okna dla Selective Repeat
+
+# --- Stałe ramki ---
 PREAMBLE_LEN = 16
-HEADER_LEN = 12           # 4 typ + 4 sekw + 3 długość + 1 rezerwa
-DATA_BITS_LEN = 26        # 26 bitów danych
-HAMMING_PARITY_LEN = 5    # 5 bitów parzystości Hamminga
-# długość ramki bez preambuły
-BITS_AFTER_PREAMBLE = HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN
+HEADER_LEN = 12
+DATA_BITS_LEN = 26
+HAMMING_PARITY_LEN = 5
+CRC_PARITY_LEN = 4
+PARITY_LEN = HAMMING_PARITY_LEN if USE_HAMMING else CRC_PARITY_LEN
+BITS_AFTER_PREAMBLE = HEADER_LEN + DATA_BITS_LEN + PARITY_LEN
 
 PREAMBLE = "1010101010101010"
 
@@ -21,25 +29,53 @@ PREAMBLE = "1010101010101010"
 FRAME_TYPE_DATA = "0001"
 FRAME_TYPE_ACK = "0010"
 FRAME_TYPE_NACK = "0011"
-FRAME_TYPE_SREJ = "0100"
 
 # --- Sygnały ACK/NACK ---
 ACK_DATA = "1" * DATA_BITS_LEN
 NACK_DATA = "0" * DATA_BITS_LEN
 
-# --- Dane testowe ---
-DATA_BITS = "11001100110011001100110001"  # 26 bitów danych
+# --- Dane testowe (9 ramek do wysłania) ---
+DATA_FRAMES = [
+    "11001100110011001100110001",  # Ramka 0
+    "11001100110011001100110010",  # Ramka 1
+    "11001100110011001100110011",  # Ramka 2
+    "11001100110011001100110100",  # Ramka 3
+    "11001100110011001100110101",  # Ramka 4
+    "11001100110011001100110110",  # Ramka 5
+    "11001100110011001100110111",  # Ramka 6
+    "11001100110011001100111000",  # Ramka 7
+    "11001100110011001100111001",  # Ramka 8
+]
 
 # --- Konfiguracja protokołu ---
-ACK_TIMEOUT_MS = 1000
-MAX_RETRANSMISSIONS = 1000
+ACK_TIMEOUT_MS = 1500
+MAX_RETRANSMISSIONS = 3
 
 # --- Inicjalizacja pinów ---
 tx = Pin(TX_PIN, Pin.OUT)
 rx = Pin(RX_PIN, Pin.IN)
 tx.value(0)
 
-# =========== FUNKCJE HAMMINGA (31,26) ===========
+# =========== FUNKCJE CRC-4 ===========
+def calculate_crc4(data_bits):
+    poly = 0x13
+    data_len = len(data_bits)
+    value = 0
+    for b in data_bits:
+        value = (value << 1) | (1 if b == '1' else 0)
+    value <<= CRC_PARITY_LEN
+    total_len = data_len + CRC_PARITY_LEN
+    for i in range(total_len - 1, CRC_PARITY_LEN - 1, -1):
+        if (value >> i) & 1:
+            value ^= (poly << (i - CRC_PARITY_LEN))
+    rem = value & ((1 << CRC_PARITY_LEN) - 1)
+    return "{:04b}".format(rem)
+
+def verify_crc4(data_bits, crc_bits):
+    calculated = calculate_crc4(data_bits)
+    return calculated == crc_bits
+
+# =========== FUNKCJE HAMMINGA ===========
 def calculate_hamming_parity(data):
     data_positions = [3,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
     word = [0] * 32
@@ -57,32 +93,42 @@ def calculate_hamming_parity(data):
 
 def verify_hamming(data, parity):
     calculated_parity = calculate_hamming_parity(data)
-    # print(f"Hamming - Odebrane dane: {data}, Odebrana parzystość: {parity}, Obliczona parzystość: {calculated_parity}")
     return calculated_parity == parity
 
+# =========== FUNKCJE UNIWERSALNE ===========
+def calculate_parity(data):
+    if USE_HAMMING:
+        return calculate_hamming_parity(data)
+    else:
+        return calculate_crc4(data)
+
+def verify_parity(data, parity):
+    if USE_HAMMING:
+        return verify_hamming(data, parity)
+    else:
+        return verify_crc4(data, parity)
+
 # =========== FUNKCJE BUDOWANIA RAMEK ===========
-def build_data_frame(seq_num=0):
+def build_data_frame(data_bits, seq_num=0):
     seq_bits = f"{seq_num:04b}"
     header = FRAME_TYPE_DATA + seq_bits + "1100"
-    parity = calculate_hamming_parity(DATA_BITS)
-    print(f"Wysyłane dane: {DATA_BITS}, Wysyłana parzystość: {parity}")
-    return PREAMBLE + header + DATA_BITS + parity
+    parity = calculate_parity(data_bits)
+    return PREAMBLE + header + data_bits + parity
 
 def build_ack_frame(seq_num=0):
     seq_bits = f"{seq_num:04b}"
     header = FRAME_TYPE_ACK + seq_bits + "1100"
-    parity = calculate_hamming_parity(ACK_DATA)
+    parity = calculate_parity(ACK_DATA)
     return PREAMBLE + header + ACK_DATA + parity
 
 def build_nack_frame(seq_num=0):
     seq_bits = f"{seq_num:04b}"
     header = FRAME_TYPE_NACK + seq_bits + "1100"
-    parity = calculate_hamming_parity(NACK_DATA)
+    parity = calculate_parity(NACK_DATA)
     return PREAMBLE + header + NACK_DATA + parity
 
-# =========== POZOSTAŁE FUNKCJE (TIMING) ===========
+# =========== FUNKCJE TRANSMISJI ===========
 def send_bits(bits):
-    # wyłącz przerwania na czas nadawania -> stabilność timingu
     irq_state = machine.disable_irq()
     try:
         for bit in bits:
@@ -92,7 +138,6 @@ def send_bits(bits):
         tx.value(0)
         machine.enable_irq(irq_state)
 
-# WAIT FOR PREAMBLE: zwraca timestamp (us) ostatniej krawędzi preambuły lub None
 def wait_for_preamble(timeout_ms=1000):
     start_time = utime.ticks_ms()
     bit_count = 0
@@ -104,11 +149,8 @@ def wait_for_preamble(timeout_ms=1000):
         if current != last_state:
             now = utime.ticks_us()
             pulse_width = utime.ticks_diff(now, last_edge)
-            # jeśli pulse_width wygląda sensownie (około jednego BIT_LEN_US), próbkuj w połowie impulsu
-            # (próbkujemy od krawędzi poprzedniej, by trafić w środek)
             if pulse_width > BIT_LEN_US * 0.4 and pulse_width < BIT_LEN_US * 1.6:
                 sample_time = utime.ticks_add(last_edge, pulse_width // 2)
-                # czekaj do sample_time
                 while utime.ticks_diff(sample_time, utime.ticks_us()) > 0:
                     pass
                 sampled = rx.value()
@@ -116,18 +158,15 @@ def wait_for_preamble(timeout_ms=1000):
                 if (expected == '1' and sampled == 1) or (expected == '0' and sampled == 0):
                     bit_count += 1
                     if bit_count == PREAMBLE_LEN:
-                        # zwróć czas tej ostatniej krawędzi (koniec preambuły)
                         return now
                 else:
                     bit_count = 0
             else:
-                # jeśli impuls był zbyt krótki/długi, zresetuj i kontynuuj
                 bit_count = 0
 
             last_edge = now
             last_state = current
 
-        # jeśli nie ma żadnych krawędzi przez długo > 3 bitów, zresetuj licznik
         if utime.ticks_diff(utime.ticks_us(), last_edge) > BIT_LEN_US * 3:
             bit_count = 0
             last_state = rx.value()
@@ -135,26 +174,20 @@ def wait_for_preamble(timeout_ms=1000):
 
     return None
 
-# READ FRAME AFTER PREAMBLE: wyrównane próbkowanie od preamble_ts
 def read_frame_after_preamble(preamble_ts):
     frame = ""
     bits_to_read = BITS_AFTER_PREAMBLE
 
-    # pierwszy bit nagłówka zaczyna się 1*BIT_LEN_US po końcu preambuły
     first_sample = utime.ticks_add(preamble_ts, BIT_LEN_US)
-    # przesunięcie do środka bitu
     first_sample = utime.ticks_add(first_sample, int(BIT_LEN_US * 0.5))
 
-    # czekaj do pierwszego sample
     while utime.ticks_diff(first_sample, utime.ticks_us()) > 0:
         pass
 
     t = first_sample
     for i in range(bits_to_read):
         frame += '1' if rx.value() else '0'
-        # przygotuj następny czas próbkowania
         t = utime.ticks_add(t, BIT_LEN_US)
-        # czekaj do czasu
         if i < bits_to_read - 1:
             while utime.ticks_diff(t, utime.ticks_us()) > 0:
                 pass
@@ -162,76 +195,183 @@ def read_frame_after_preamble(preamble_ts):
     return frame
 
 def verify_frame(frame):
-    if len(frame) != HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN:
-        print(f"❌ Błędna długość ramki: {len(frame)}, oczekiwano: {HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN}")
-        return False
-
+    expected_len = HEADER_LEN + DATA_BITS_LEN + PARITY_LEN
+    if len(frame) != expected_len:
+        print(f"❌ Błędna długość ramki: {len(frame)}, oczekiwano: {expected_len}")
+        return None, None, None
+    
     header = frame[:HEADER_LEN]
     data = frame[HEADER_LEN:HEADER_LEN + DATA_BITS_LEN]
     parity = frame[HEADER_LEN + DATA_BITS_LEN:]
+    
+    frame_type = header[:4]
+    seq_num = int(header[4:8], 2)
+    
+    valid = verify_parity(data, parity)
+    
+    return frame_type, seq_num, valid
 
-    print(f"Odebrany nagłówek: {header}")
-    print(f"Odebrane dane: {data}")
-    print(f"Odebrana parzystość: {parity}")
+# =========== SELECTIVE REPEAT - GŁÓWNA LOGIKA ===========
+def selective_repeat_transmission():
+    total_frames = len(DATA_FRAMES)
+    num_groups = (total_frames + WINDOW_SIZE - 1) // WINDOW_SIZE
+    
+    print(f"Rozpoczynam transmisję {total_frames} ramek w {num_groups} grupach")
+    
+    for group in range(num_groups):
+        group_start = group * WINDOW_SIZE
+        group_end = min(group_start + WINDOW_SIZE, total_frames)
+        
+        print(f"\n=== GRUPA {group + 1}/{num_groups} (ramki {group_start} do {group_end-1}) ===")
+        
+        # Lista ramek do wysłania w tej grupie
+        frames_to_send = list(range(group_start, group_end))
+        unacked_frames = frames_to_send.copy()
+        retry_count = 0
+        
+        while unacked_frames and retry_count < MAX_RETRANSMISSIONS:
+            print(f"\nPróba {retry_count + 1} dla grupy {group + 1}")
+            print(f"Ramki do potwierdzenia: {unacked_frames}")
+            
+            for seq_num in frames_to_send:
+                if seq_num not in unacked_frames:
+                    continue  # Ramka już potwierdzona
+                    
+                print(f"\n📤 Wysyłam ramkę {seq_num}")
+                data = DATA_FRAMES[seq_num]
+                frame_to_send = build_data_frame(data, seq_num)
+                print(f"Tryb: {'Hamming' if USE_HAMMING else 'CRC-4'}")
+                print(f"Dane: {data}")
+                print(f"Parzystość: {calculate_parity(data)}")
+                send_bits(frame_to_send)
+                
+                # Czekaj na ACK/NACK
+                ack_received = False
+                ack_wait_start = utime.ticks_ms()
+                
+                while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
+                    preamble_time = wait_for_preamble(ACK_TIMEOUT_MS // 2)
+                    if preamble_time is None:
+                        continue
+                    
+                    response_frame = read_frame_after_preamble(preamble_time)
+                    frame_type, resp_seq, valid = verify_frame(response_frame)
+                    
+                    if valid and frame_type in [FRAME_TYPE_ACK, FRAME_TYPE_NACK]:
+                        if resp_seq == seq_num:
+                            if frame_type == FRAME_TYPE_ACK:
+                                print(f"✅ Otrzymano ACK dla ramki {seq_num}")
+                                if seq_num in unacked_frames:
+                                    unacked_frames.remove(seq_num)
+                                ack_received = True
+                            else:
+                                print(f"❌ Otrzymano NACK dla ramki {seq_num}")
+                            break
+                        else:
+                            print(f"⚠️  Otrzymano odpowiedź dla innej ramki ({resp_seq}), ignoruję")
+                    else:
+                        print("⚠️  Odebrano nieprawidłową ramkę odpowiedzi")
+                
+                if not ack_received and seq_num in unacked_frames:
+                    print(f"⏰ Timeout dla ramki {seq_num}")
+                
+                utime.sleep_ms(500)  # Przerwa między ramkami
+            
+            # Sprawdź które ramki nadal nie są potwierdzone
+            if unacked_frames:
+                print(f"\nNiepotwierdzone ramki po próbie {retry_count + 1}: {unacked_frames}")
+                retry_count += 1
+                # W następnej próbie wyślij tylko niepotwierdzone ramki
+                frames_to_send = unacked_frames.copy()
+            else:
+                print(f"✅ Wszystkie ramki w grupie {group + 1} potwierdzone")
+                break
+        
+        if unacked_frames:
+            print(f"🛑 Nie udało się przesłać ramek {unacked_frames} po {MAX_RETRANSMISSIONS} próbach")
+            # Kontynuuj z następną grupą
+            unacked_frames.clear()
+        
+        utime.sleep_ms(2000)  # Przerwa między grupami
+    
+    print("\n" + "="*50)
+    print("TRANSMISJA ZAKOŃCZONA")
+    print(f"Wysłano {total_frames} ramek w {num_groups} grupach")
+    print("="*50)
 
-    return verify_hamming(data, parity)
+# =========== STOP-AND-WAIT - GŁÓWNA LOGIKA ===========
+def stop_and_wait_transmission():
+    total_frames = len(DATA_FRAMES)
+    seq_num = 0
+    
+    print(f"Rozpoczynam transmisję {total_frames} ramek (Stop-and-Wait)")
+    
+    while seq_num < total_frames:
+        print(f"\n=== RAMKA {seq_num + 1}/{total_frames} ===")
+        
+        data = DATA_FRAMES[seq_num]
+        frame_to_send = build_data_frame(data, seq_num)
+        print(f"Tryb: {'Hamming' if USE_HAMMING else 'CRC-4'}")
+        print(f"Dane: {data}")
+        print(f"Parzystość: {calculate_parity(data)}")
+        
+        print("📤 Wysyłam ramkę...")
+        send_bits(frame_to_send)
+        
+        # Czekaj na ACK
+        ack_received = False
+        retry_count = 0
+        
+        while not ack_received and retry_count < MAX_RETRANSMISSIONS:
+            print(f"\nOczekiwanie na ACK (próba {retry_count + 1}/{MAX_RETRANSMISSIONS})...")
+            ack_wait_start = utime.ticks_ms()
+            
+            while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
+                preamble_time = wait_for_preamble(ACK_TIMEOUT_MS // 2)
+                if preamble_time is None:
+                    continue
+                
+                response_frame = read_frame_after_preamble(preamble_time)
+                frame_type, resp_seq, valid = verify_frame(response_frame)
+                
+                if valid and frame_type == FRAME_TYPE_ACK and resp_seq == seq_num:
+                    print(f"✅ Otrzymano ACK dla ramki {seq_num}")
+                    ack_received = True
+                    seq_num += 1
+                    break
+                elif valid and frame_type == FRAME_TYPE_NACK and resp_seq == seq_num:
+                    print(f"❌ Otrzymano NACK dla ramki {seq_num}")
+                    break
+            
+            if not ack_received:
+                retry_count += 1
+                if retry_count < MAX_RETRANSMISSIONS:
+                    print(f"🔄 Retransmisja ramki {seq_num}")
+                    send_bits(frame_to_send)
+                else:
+                    print(f"🛑 Przekroczono maksymalną liczbę retransmisji dla ramki {seq_num}")
+                    seq_num += 1  # Przejdź do następnej ramki mimo braku ACK
+        
+        utime.sleep_ms(2000)  # Przerwa między ramkami
+    
+    print("\n" + "="*50)
+    print("TRANSMISJA ZAKOŃCZONA")
+    print(f"Wysłano {total_frames} ramek")
+    print("="*50)
 
 # =========== GŁÓWNA PĘTLA ===========
-print("=== Raspberry Pi Pico TX/RX ready (Hamming) ===")
-retransmission_count = 0
-sequence_number = 0
+print("=== Raspberry Pi Pico TX/RX ready ===")
+print(f"Tryb korekcji: {'Hamming (31,26)' if USE_HAMMING else 'CRC-4'}")
+print(f"Tryb transmisji: {'Selective Repeat' if USE_SELECTIVE_REPEAT else 'Stop-and-Wait'}")
+print(f"Rozmiar okna: {WINDOW_SIZE}")
+print(f"Maksymalna liczba retransmisji: {MAX_RETRANSMISSIONS}")
+print(f"Liczba ramek do wysłania: {len(DATA_FRAMES)}")
 
 while True:
-    ack_received = False
-
-    print("\n=== PRÓBA WYSŁANIA RAMKI  ===")
-    # KROK 1: Przygotuj i wyślij ramkę danych z Hammingiem
-    frame_to_send = build_data_frame(sequence_number)
-    print(f"Wysyłana ramka: {frame_to_send}")
-    send_bits(frame_to_send)
-
-    # KROK 2: Czekaj na ACK
-    print("\n=== Oczekiwanie na ACK ===")
-    ack_wait_start = utime.ticks_ms()
-
-    while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
-        preamble_time = wait_for_preamble(ACK_TIMEOUT_MS)
-        if preamble_time is None:
-            # brak preambuły w tym okresie - kontynuuj oczekiwanie
-            continue
-
-        # mamy timestamp końca preambuły -> czytaj ramkę względem tego czasu
-        ack_frame = read_frame_after_preamble(preamble_time)
-        print(f"Odebrana ramka ACK ({len(ack_frame)} bit): {ack_frame}")
-
-        if verify_frame(ack_frame):
-            header = ack_frame[:HEADER_LEN]
-            frame_type = header[:4]
-
-            if frame_type == FRAME_TYPE_ACK:
-                print("✅ Otrzymano ACK - transmisja udana!")
-                ack_received = True
-                retransmission_count = 0
-                sequence_number = (sequence_number + 1) % 16
-                break
-            elif frame_type == FRAME_TYPE_NACK:
-                print("❌ Otrzymano NACK - błąd transmisji")
-                break
-        else:
-            print("❓ Odebrano nieznany sygnał / ramka z błędem")
-
-    # KROK 3: Obsłuż brak potwierdzenia
-    if not ack_received:
-        print("⏰ Timeout ACK - brak odpowiedzi")
-        retransmission_count += 1
-
-        if retransmission_count >= MAX_RETRANSMISSIONS:
-            print("🛑 Przekroczono maksymalną liczbę retransmisji")
-            retransmission_count = 0
-            sequence_number = (sequence_number + 1) % 16
-        else:
-            print("🔄 Retransmisja #" + str(retransmission_count))
-
-    # KROK 4: Przerwa przed następną transmisją
-    utime.sleep_ms(2000)
-
+    if USE_SELECTIVE_REPEAT:
+        selective_repeat_transmission()
+    else:
+        stop_and_wait_transmission()
+    
+    print("\n🔁 Rozpoczynam nową transmisję za 5 sekund...")
+    utime.sleep(5)
