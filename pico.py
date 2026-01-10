@@ -14,6 +14,10 @@ USE_HAMMING = False
 USE_SELECTIVE_REPEAT = True  # True = Selective Repeat, False = Stop-and-Wait
 WINDOW_SIZE = 3  # Rozmiar okna dla Selective Repeat
 
+# --- Burst / powtórzenia ---
+BURST_COUNT = 3              # Ile razy wysyłamy tę samą ramkę pod rząd (ustaw na 2 lub 3)
+INTER_FRAME_GAP_MS = 10      # przerwa między powtórzeniami ramek w ms
+
 # --- Stałe ramki ---
 PREAMBLE_LEN = 16
 HEADER_LEN = 12
@@ -138,6 +142,33 @@ def send_bits(bits):
         tx.value(0)
         machine.enable_irq(irq_state)
 
+def is_line_idle(required_us=None):
+    # Sprawdź czy linia RX jest nieaktywna (LOW) przez required_us mikrosekund.
+    # Jeśli required_us == None, użyj długości preambuły jako czasu do sprawdzenia.
+    if required_us is None:
+        required_us = PREAMBLE_LEN * BIT_LEN_US
+    start = utime.ticks_us()
+    while utime.ticks_diff(utime.ticks_us(), start) < required_us:
+        if rx.value() == 1:
+            return False
+    return True
+
+def send_frame_burst(bits, burst_count=BURST_COUNT):
+    # Najpierw upewnij się, że linia wolna - jeśli nie, poczekaj krótki losowy backoff
+    attempts = 0
+    while not is_line_idle() and attempts < 5:
+        # prosty pseudo-random backoff (nie wymaga modułu random)
+        delay_ms = (utime.ticks_us() & 0xFF) % 50 + 5
+        utime.sleep_ms(delay_ms)
+        attempts += 1
+
+    for i in range(burst_count):
+        send_bits(bits)
+        # mała przerwa między powtórzeniami, aby druga strona mogła odróżnić powtórzenia
+        utime.sleep_ms(INTER_FRAME_GAP_MS)
+    # po burst ustaw linię low
+    tx.value(0)
+
 def wait_for_preamble(timeout_ms=1000):
     start_time = utime.ticks_ms()
     bit_count = 0
@@ -237,13 +268,13 @@ def selective_repeat_transmission():
                 if seq_num not in unacked_frames:
                     continue  # Ramka już potwierdzona
                     
-                print(f"\n📤 Wysyłam ramkę {seq_num}")
+                print(f"\n📤 Wysyłam ramkę {seq_num} (burst x{BURST_COUNT})")
                 data = DATA_FRAMES[seq_num]
                 frame_to_send = build_data_frame(data, seq_num)
                 print(f"Tryb: {'Hamming' if USE_HAMMING else 'CRC-4'}")
                 print(f"Dane: {data}")
                 print(f"Parzystość: {calculate_parity(data)}")
-                send_bits(frame_to_send)
+                send_frame_burst(frame_to_send, BURST_COUNT)
                 
                 # Czekaj na ACK/NACK
                 ack_received = False
@@ -316,7 +347,7 @@ def stop_and_wait_transmission():
         print(f"Parzystość: {calculate_parity(data)}")
         
         print("📤 Wysyłam ramkę...")
-        send_bits(frame_to_send)
+        send_frame_burst(frame_to_send, BURST_COUNT)
         
         # Czekaj na ACK
         ack_received = False
@@ -347,7 +378,7 @@ def stop_and_wait_transmission():
                 retry_count += 1
                 if retry_count < MAX_RETRANSMISSIONS:
                     print(f"🔄 Retransmisja ramki {seq_num}")
-                    send_bits(frame_to_send)
+                    send_frame_burst(frame_to_send, BURST_COUNT)
                 else:
                     print(f"🛑 Przekroczono maksymalną liczbę retransmisji dla ramki {seq_num}")
                     seq_num += 1  # Przejdź do następnej ramki mimo braku ACK
@@ -366,6 +397,7 @@ print(f"Tryb transmisji: {'Selective Repeat' if USE_SELECTIVE_REPEAT else 'Stop-
 print(f"Rozmiar okna: {WINDOW_SIZE}")
 print(f"Maksymalna liczba retransmisji: {MAX_RETRANSMISSIONS}")
 print(f"Liczba ramek do wysłania: {len(DATA_FRAMES)}")
+print(f"BURST_COUNT: {BURST_COUNT}, INTER_FRAME_GAP_MS: {INTER_FRAME_GAP_MS}")
 
 while True:
     if USE_SELECTIVE_REPEAT:
