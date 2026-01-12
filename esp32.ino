@@ -1,272 +1,513 @@
 #include <Arduino.h>
 #include <esp_timer.h>
+#include "esp_system.h"
 
 const int RX_PIN = 21;
 const int TX_PIN = 47;
 const unsigned long BIT_LEN_US = 990;
 const unsigned long BIT_READ_DELAY_US = 1030;
 
-// --- Tryb korekcji błędów ---
-const bool USE_HAMMING = false; // true = Hamming (31,26), false = CRC-4
+const bool USE_HAMMING = true;
+const bool USE_SELECTIVE_REPEAT = true;
+const int WINDOW_SIZE = 3;
+const int BURST_COUNT = 6;
+const int INTER_FRAME_GAP_MS = 10;
 
-// --- Tryb transmisji ---
-const bool USE_SELECTIVE_REPEAT = true; // true = Selective Repeat, false = Stop-and-Wait
-const int WINDOW_SIZE = 3; // Rozmiar okna
-
-// --- Stałe ramki ---
 const int PREAMBLE_LEN = 16;
 const int HEADER_LEN = 12;
 const int DATA_BITS_LEN = 26;
 const int HAMMING_PARITY_LEN = 5;
 const int CRC_PARITY_LEN = 4;
 const int PARITY_LEN = USE_HAMMING ? HAMMING_PARITY_LEN : CRC_PARITY_LEN;
-
+const int GROUP_SIZE = 4;
+const int FRAME_LEN = PREAMBLE_LEN + HEADER_LEN + HAMMING_PARITY_LEN + DATA_BITS_LEN;
 const String PREAMBLE = "1010101010101010";
 
-// --- Typy ramek ---
 const String FRAME_TYPE_DATA = "0001";
-const String FRAME_TYPE_ACK = "0010"; 
+const String FRAME_TYPE_ACK = "0010";
 const String FRAME_TYPE_NACK = "0011";
 
-// --- Dane ACK/NACK ---
 const String ACK_DATA = "11111111111111111111111111";
 const String NACK_DATA = "00000000000000000000000000";
 
-// --- Funkcje CRC-4 ---
-String calculate_crc4(const String &data) {
+String calculate_crc4(const String &data)
+{
     const int poly_len = 5;
-    const int poly[poly_len] = {1,0,0,1,1};
-
+    const int poly[poly_len] = {1, 0, 0, 1, 1};
     int data_len = data.length();
     int bits_size = data_len + CRC_PARITY_LEN;
-    if (bits_size > 64) {
-      Serial.println("ERROR: data too long for CRC function");
-      return String("0000");
+    if (bits_size > 64)
+    {
+        return String("0000");
     }
-
     int bits[64];
-    for (int i = 0; i < data_len; ++i) {
+    for (int i = 0; i < data_len; ++i)
+    {
         bits[i] = (data[i] == '1') ? 1 : 0;
     }
-    for (int i = 0; i < CRC_PARITY_LEN; ++i) {
+    for (int i = 0; i < CRC_PARITY_LEN; ++i)
+    {
         bits[data_len + i] = 0;
     }
-
-    for (int i = 0; i < data_len; ++i) {
-        if (bits[i] == 1) {
-            for (int j = 0; j < poly_len; ++j) {
+    for (int i = 0; i < data_len; ++i)
+    {
+        if (bits[i] == 1)
+        {
+            for (int j = 0; j < poly_len; ++j)
+            {
                 bits[i + j] ^= poly[j];
             }
         }
     }
-
     String out = "";
-    for (int k = 0; k < CRC_PARITY_LEN; ++k) {
+    for (int k = 0; k < CRC_PARITY_LEN; ++k)
+    {
         out += bits[data_len + k] ? '1' : '0';
     }
     return out;
 }
 
-bool verify_crc4(const String &data, const String &parity) {
+bool verify_crc4(const String &data, const String &parity)
+{
     String calculated = calculate_crc4(data);
-    Serial.print("CRC-4 - Dane: "); Serial.print(data);
-    Serial.print(", Parzystość: "); Serial.print(parity);
-    Serial.print(", Obliczona: "); Serial.println(calculated);
+    Serial.print("CRC-4 - Dane: ");
+    Serial.print(data);
+    Serial.print(", Parzystość: ");
+    Serial.print(parity);
+    Serial.print(", Obliczona: ");
+    Serial.println(calculated);
     return calculated == parity;
 }
 
-// --- Funkcje Hamminga ---
-String calculate_hamming_parity(const String &data) {
-  int data_positions[26] = {3,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
-  int word[32] = {0};
-  
-  for (int i = 0; i < 26; i++) {
-    word[data_positions[i]] = (data[i] == '1') ? 1 : 0;
-  }
+const int data_positions[26] = {3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
 
-  int p1=0, p2=0, p4=0, p8=0, p16=0;
-  for (int j = 1; j <= 31; j++) {
-    if (j & 1) p1 ^= word[j];
-    if (j & 2) p2 ^= word[j];
-    if (j & 4) p4 ^= word[j];
-    if (j & 8) p8 ^= word[j];
-    if (j & 16) p16 ^= word[j];
-  }
-
-  return String(p1) + String(p2) + String(p4) + String(p8) + String(p16);
+int calculate_syndrome_bit(int bit_pos, int word[])
+{
+    int parity = 0;
+    for (int j = 1; j <= 31; j++)
+    {
+        if (j & bit_pos)
+        {
+            parity ^= word[j];
+        }
+    }
+    return parity;
 }
 
-bool verify_hamming(const String &data, const String &parity) {
-  String calculated = calculate_hamming_parity(data);
-  Serial.print("Hamming - Dane: "); Serial.print(data);
-  Serial.print(", Parzystość: "); Serial.print(parity);
-  Serial.print(", Obliczona: "); Serial.println(calculated);
-  return calculated == parity;
+String calculate_hamming_parity(const String &data)
+{
+    int word[32] = {0};
+    for (int i = 0; i < 26; i++)
+    {
+        word[data_positions[i]] = (data[i] == '1') ? 1 : 0;
+    }
+    String p = "";
+    p += String(calculate_syndrome_bit(1, word));
+    p += String(calculate_syndrome_bit(2, word));
+    p += String(calculate_syndrome_bit(4, word));
+    p += String(calculate_syndrome_bit(8, word));
+    p += String(calculate_syndrome_bit(16, word));
+    return p;
 }
 
-// --- Funkcje uniwersalne ---
-String calculate_parity(const String &data) {
-    if (USE_HAMMING) {
+bool verify_hamming(String &data, const String &parity)
+{
+    int word[32] = {0};
+    for (int i = 0; i < 26; i++)
+    {
+        word[data_positions[i]] = (data[i] == '1') ? 1 : 0;
+    }
+    word[1] = (parity[0] == '1') ? 1 : 0;
+    word[2] = (parity[1] == '1') ? 1 : 0;
+    word[4] = (parity[2] == '1') ? 1 : 0;
+    word[8] = (parity[3] == '1') ? 1 : 0;
+    word[16] = (parity[4] == '1') ? 1 : 0;
+    int syndrome = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        if (calculate_syndrome_bit(1 << i, word))
+        {
+            syndrome |= (1 << i);
+        }
+    }
+    if (syndrome == 0)
+        return true;
+    if (syndrome >= 1 && syndrome <= 31)
+    {
+        word[syndrome] ^= 1;
+    }
+    int check_syndrome = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        if (calculate_syndrome_bit(1 << i, word))
+        {
+            check_syndrome |= (1 << i);
+        }
+    }
+    if (check_syndrome == 0)
+    {
+        String fixed_data = "";
+        for (int i = 0; i < 26; i++)
+        {
+            fixed_data += (word[data_positions[i]] ? '1' : '0');
+        }
+        data = fixed_data;
+        Serial.print("🛠️ Hamming: Naprawiono błąd na pozycji ");
+        Serial.println(syndrome);
+        return true;
+    }
+    else
+    {
+        Serial.println("❌ Hamming: Wykryto błędy wielokrotne! Wysyłam NACK.");
+        return false;
+    }
+}
+
+String calculate_parity(const String &data)
+{
+    if (USE_HAMMING)
+    {
         return calculate_hamming_parity(data);
-    } else {
+    }
+    else
+    {
         return calculate_crc4(data);
     }
 }
 
-bool verify_parity(const String &data, const String &parity) {
-    if (USE_HAMMING) {
+bool verify_parity(String &data, const String &parity)
+{
+    if (USE_HAMMING)
+    {
         return verify_hamming(data, parity);
-    } else {
+    }
+    else
+    {
         return verify_crc4(data, parity);
     }
 }
 
-// --- Budowanie ramek ACK/NACK ---
-String build_ack_frame(int seq_num) {
-  String seq_bits = String(seq_num, BIN);
-  while (seq_bits.length() < 4) seq_bits = "0" + seq_bits;
-  String header = FRAME_TYPE_ACK + seq_bits + "1100";
-  return PREAMBLE + header + ACK_DATA + calculate_parity(ACK_DATA);
+String build_ack_frame(int seq_num)
+{
+    String seq_bits = String(seq_num, BIN);
+    while (seq_bits.length() < 4)
+        seq_bits = "0" + seq_bits;
+    String header = FRAME_TYPE_ACK + seq_bits + "1100";
+    return PREAMBLE + header + ACK_DATA + calculate_parity(ACK_DATA);
 }
 
-String build_nack_frame(int seq_num) {
-  String seq_bits = String(seq_num, BIN);
-  while (seq_bits.length() < 4) seq_bits = "0" + seq_bits;
-  String header = FRAME_TYPE_NACK + seq_bits + "1100";
-  return PREAMBLE + header + NACK_DATA + calculate_parity(NACK_DATA);
+String build_nack_frame(int seq_num)
+{
+    String seq_bits = String(seq_num, BIN);
+    while (seq_bits.length() < 4)
+        seq_bits = "0" + seq_bits;
+    String header = FRAME_TYPE_NACK + seq_bits + "1100";
+    Serial.println(seq_bits);
+    return PREAMBLE + header + NACK_DATA + calculate_parity(NACK_DATA);
 }
 
-// --- Wysyłanie bitów ---
-void send_bits(const String &bits) {
-  Serial.print("Wysyłanie: "); Serial.println(bits);
-  for (int i=0; i < bits.length(); i++) {
-    digitalWrite(TX_PIN, bits[i]=='1'?HIGH:LOW);
-    ets_delay_us(BIT_LEN_US);
-  }
-  digitalWrite(TX_PIN, LOW);
-}
-
-// --- Odbiór preambuły ---
-bool wait_for_preamble() {
-  uint64_t start_time = esp_timer_get_time();
-  int bit_count = 0;
-  int last_state = digitalRead(RX_PIN);
-
-  while ((esp_timer_get_time() - start_time) < 2000000) {
-    uint64_t edge_start = esp_timer_get_time();
-    while (digitalRead(RX_PIN) == last_state) {
-      if ((esp_timer_get_time() - edge_start) > (BIT_LEN_US * 2)) {
-        bit_count = 0;
-        break;
-      }
+void send_bits(const String &bits)
+{
+    Serial.print("Wysyłanie: ");
+    Serial.println(bits);
+    for (int i = 0; i < bits.length(); i++)
+    {
+        digitalWrite(TX_PIN, bits[i] == '1' ? HIGH : LOW);
+        ets_delay_us(BIT_LEN_US);
     }
-
-    if ((esp_timer_get_time() - edge_start) > (BIT_LEN_US * 2)) {
-      last_state = digitalRead(RX_PIN);
-      continue;
-    }
-
-    uint64_t bit_center_time = esp_timer_get_time() + (BIT_LEN_US / 2);
-    while (esp_timer_get_time() < bit_center_time) {}
-    
-    int current_bit = digitalRead(RX_PIN);
-    char expected_bit = PREAMBLE[bit_count];
-
-    if ((expected_bit=='1' && current_bit==HIGH) ||
-        (expected_bit=='0' && current_bit==LOW)) {
-      bit_count++;
-      if (bit_count == PREAMBLE_LEN) return true;
-    } else {
-      bit_count = 0;
-    }
-
-    last_state = current_bit;
-  }
-  return false;
+    digitalWrite(TX_PIN, LOW);
 }
 
-// --- Odczyt ramki po preambule ---
-String read_frame_after_preamble() {
-  String frame = "";
-  int bits_to_read = HEADER_LEN + DATA_BITS_LEN + PARITY_LEN;
-
-  uint64_t first_bit_time = esp_timer_get_time() + (BIT_READ_DELAY_US / 2);
-  while (esp_timer_get_time() < first_bit_time) {}
-
-  for (int i=0; i < bits_to_read; i++) {
-    frame += (digitalRead(RX_PIN)?'1':'0');
-    if (i < bits_to_read-1) {
-      uint64_t next_bit_time = esp_timer_get_time() + BIT_READ_DELAY_US;
-      while (esp_timer_get_time() < next_bit_time) {}
+bool is_line_idle(unsigned long required_us = 0)
+{
+    if (required_us == 0)
+        required_us = PREAMBLE_LEN * BIT_LEN_US;
+    unsigned long start = esp_timer_get_time();
+    while ((esp_timer_get_time() - start) < required_us)
+    {
+        if (digitalRead(RX_PIN) == HIGH)
+            return false;
     }
-  }
-  return frame;
+    return true;
 }
 
-// --- Weryfikacja ramki ---
-bool verify_frame(const String &frame, int &seq_num) {
-  if (frame.length() != HEADER_LEN + DATA_BITS_LEN + PARITY_LEN) {
-    Serial.print("❌ Błędna długość ramki: "); Serial.println(frame.length());
+void send_frame_burst(const String &frame)
+{
+    int attempts = 0;
+    while (!is_line_idle() && attempts < 5)
+    {
+        uint32_t r = esp_random();
+        int delay_ms = (r % 96) + 5;
+        delay(delay_ms);
+        attempts++;
+    }
+    for (int i = 0; i < BURST_COUNT; ++i)
+    {
+        send_bits(frame);
+        delay(INTER_FRAME_GAP_MS);
+    }
+    digitalWrite(TX_PIN, LOW);
+}
+
+bool wait_for_preamble()
+{
+    uint64_t start_time = esp_timer_get_time();
+    int bit_count = 0;
+    int last_state = digitalRead(RX_PIN);
+    while ((esp_timer_get_time() - start_time) < 2000000)
+    {
+        uint64_t edge_start = esp_timer_get_time();
+        while (digitalRead(RX_PIN) == last_state)
+        {
+            if ((esp_timer_get_time() - edge_start) > (BIT_LEN_US * 2))
+            {
+                bit_count = 0;
+                break;
+            }
+        }
+        if ((esp_timer_get_time() - edge_start) > (BIT_LEN_US * 2))
+        {
+            last_state = digitalRead(RX_PIN);
+            continue;
+        }
+        uint64_t bit_center_time = esp_timer_get_time() + (BIT_LEN_US / 2);
+        while (esp_timer_get_time() < bit_center_time)
+        {
+        }
+        int current_bit = digitalRead(RX_PIN);
+        char expected_bit = PREAMBLE[bit_count];
+        if ((expected_bit == '1' && current_bit == HIGH) || (expected_bit == '0' && current_bit == LOW))
+        {
+            bit_count++;
+            if (bit_count == PREAMBLE_LEN)
+                return true;
+        }
+        else
+        {
+            bit_count = 0;
+        }
+        last_state = current_bit;
+    }
     return false;
-  }
-  
-  String header = frame.substring(0, HEADER_LEN);
-  String data = frame.substring(HEADER_LEN, HEADER_LEN + DATA_BITS_LEN);
-  String parity = frame.substring(HEADER_LEN + DATA_BITS_LEN);
-  
-  // Wyodrębnij numer sekwencji
-  String seq_bits = header.substring(4, 8);
-  seq_num = strtol(seq_bits.c_str(), NULL, 2);
-
-  Serial.print("Nagłówek: "); Serial.println(header);
-  Serial.print("Dane: "); Serial.println(data);
-  Serial.print("Parzystość: "); Serial.println(parity);
-  Serial.print("Numer sekwencji: "); Serial.println(seq_num);
-
-  return verify_parity(data, parity);
 }
 
-// --- Setup i loop ---
-void setup() {
-  Serial.begin(115200);
-  pinMode(RX_PIN, INPUT);
-  pinMode(TX_PIN, OUTPUT);
-  digitalWrite(TX_PIN, LOW);
-
-  Serial.println("ESP32 ready: listening for frames...");
-  Serial.print("Tryb korekcji: ");
-  if (USE_HAMMING) {
-    Serial.println("Hamming (31,26) - 5 bitów parzystości");
-  } else {
-    Serial.println("CRC-4 - 4 bity parzystości");
-  }
-  Serial.print("Tryb transmisji: ");
-  if (USE_SELECTIVE_REPEAT) {
-    Serial.print("Selective Repeat (okno = "); Serial.print(WINDOW_SIZE); Serial.println(")");
-  } else {
-    Serial.println("Stop-and-Wait");
-  }
-  Serial.print("Bitów parzystości: "); Serial.println(PARITY_LEN);
-}
-
-void loop() {
-  if (wait_for_preamble()) {
-    Serial.println("\n✅ Preambuła znaleziona!");
-
-    String frame = read_frame_after_preamble();
-    Serial.print("Odebrana ramka ("); Serial.print(frame.length()); Serial.println(" bitów)");
-    
-    int seq_num = 0;
-    if (verify_frame(frame, seq_num)) {
-      Serial.print("✅ RAMKA "); Serial.print(seq_num); Serial.println(" POPRAWNA - wysyłam ACK");
-      delay(100);
-      send_bits(build_ack_frame(seq_num));
-      Serial.println("ACK wysłany");
-    } else {
-      Serial.print("❌ BŁĄD RAMKI "); Serial.print(seq_num); Serial.println(" - wysyłam NACK");
-      delay(100);
-      send_bits(build_nack_frame(seq_num));
-      Serial.println("NACK wysłany");
+String read_frame_after_preamble()
+{
+    String frame = "";
+    int bits_to_read = HEADER_LEN + DATA_BITS_LEN + PARITY_LEN;
+    uint64_t first_bit_time = esp_timer_get_time() + (BIT_READ_DELAY_US / 2);
+    while (esp_timer_get_time() < first_bit_time)
+    {
     }
-  }
+    for (int i = 0; i < bits_to_read; i++)
+    {
+        frame += (digitalRead(RX_PIN) ? '1' : '0');
+        if (i < bits_to_read - 1)
+        {
+            uint64_t next_bit_time = esp_timer_get_time() + BIT_READ_DELAY_US;
+            while (esp_timer_get_time() < next_bit_time)
+            {
+            }
+        }
+    }
+    return frame;
+}
+
+bool verify_frame(String &frame, int &seq_num, int &gg_num)
+{
+    if (frame.length() != HEADER_LEN + DATA_BITS_LEN + PARITY_LEN)
+    {
+        Serial.print("❌ Błędna długość ramki: ");
+        Serial.println(frame.length());
+        return false;
+    }
+    String header = frame.substring(0, HEADER_LEN);
+    String data = frame.substring(HEADER_LEN, HEADER_LEN + DATA_BITS_LEN);
+    String parity = frame.substring(HEADER_LEN + DATA_BITS_LEN);
+    String seq_bits = header.substring(4, 8);
+    seq_num = strtol(seq_bits.c_str(), NULL, 2);
+    String gg = header.substring(8, 10);
+    gg_num = strtol(gg.c_str(), NULL, 2) + 1;
+    Serial.println(gg_num);
+    bool ok = verify_parity(data, parity);
+    if (USE_HAMMING && ok)
+    {
+        frame = header + data + parity;
+    }
+    return ok;
+}
+
+String introduce_random_errors(const String &frame, float error_probability = 0.1)
+{
+    String corrupted = frame;
+    for (int i = PREAMBLE_LEN; i < corrupted.length(); i++)
+    {
+        if (((float)random(0, 1000) / 1000.0) < error_probability)
+        {
+            corrupted[i] = (corrupted[i] == '1') ? '0' : '1';
+        }
+    }
+    return corrupted;
+}
+
+bool received_frames[GROUP_SIZE];
+int current_group_start = 0;
+bool group_complete = false;
+
+void reset_group()
+{
+    for (int i = 0; i < GROUP_SIZE; i++)
+        received_frames[i] = false;
+}
+
+unsigned long group_start_time_us = 0;
+bool group_timer_active = false;
+
+void setup()
+{
+    Serial.begin(115200);
+    pinMode(RX_PIN, INPUT);
+    pinMode(TX_PIN, OUTPUT);
+    digitalWrite(TX_PIN, LOW);
+    reset_group();
+    Serial.println("ESP32 ready: listening...");
+}
+
+void loop()
+{
+    if (wait_for_preamble())
+    {
+        Serial.println("\n✅ Preambuła znaleziona!");
+        String frame = read_frame_after_preamble();
+        int seq_num = 0;
+        int gg_num = 4;
+        if (verify_frame(frame, seq_num, gg_num))
+        {
+            Serial.print("✅ RAMKA ");
+            Serial.print(seq_num);
+            Serial.println(" OK");
+            if (USE_SELECTIVE_REPEAT){
+                if (!group_timer_active) {
+                    group_start_time_us = esp_timer_get_time();
+                    group_timer_active = true;
+                Serial.println("⏱️ Start timera grupy");
+                }
+
+                if (seq_num >= current_group_start && seq_num < current_group_start + GROUP_SIZE)
+                {
+                    int idx = seq_num - current_group_start;
+                    if (!received_frames[idx])
+                    {
+                        received_frames[idx] = true;
+                         Serial.println("[");
+                         for(bool a : received_frames){
+                        if(a) Serial.print("1");
+                        else Serial.print("0");
+                    }
+                    Serial.print("]");
+                        Serial.print("➕ Dodano ramkę ");
+                        Serial.println(seq_num);
+                    }
+                    else
+                    {
+                        Serial.print("⏪ Odebrano starą ramkę ");
+                        Serial.println(seq_num);
+                    }
+                }
+                group_complete = true;
+                for (int i = 0; i < gg_num; i++)
+                {
+                    if (!received_frames[i])
+                    {
+                        group_complete = false;
+                        break;
+                    }
+                }
+
+                if (group_complete)
+                {
+                    int last_seq = current_group_start + GROUP_SIZE - 1;
+                    unsigned long wait_us = BIT_LEN_US * FRAME_LEN * GROUP_SIZE * 2.5;
+                    Serial.print("⏱️ Czekam ");
+                    Serial.print(wait_us / 1000);
+                    Serial.println(" us przed ACK...");
+                    delayMicroseconds(wait_us);
+                    Serial.print("📤 Wysyłam ACK dla grupy ");
+                    Serial.print(current_group_start);
+                    Serial.print("-");
+                    Serial.println(last_seq);
+                    send_frame_burst(build_ack_frame(last_seq));
+                    group_timer_active = false;
+                }
+
+                if (group_complete && seq_num >= current_group_start + GROUP_SIZE)
+                {
+                    current_group_start += GROUP_SIZE;
+                    for (int i = 0; i < GROUP_SIZE; i++)
+                        received_frames[i] = false;
+                    group_complete = false;
+                    Serial.print("➡️ Przesunięto grupę, nowy current_group_start = ");
+                    Serial.println(current_group_start);
+                    int idx = seq_num - current_group_start;
+                    received_frames[idx] = true;
+                    Serial.print("➕ Dodano ramkę ");
+                    Serial.println(seq_num);
+                }
+            
+            }
+            else
+            {
+                Serial.print("📤 Wysyłam ACK dla ramki ");
+                Serial.println(seq_num);
+                delay(50);
+                send_frame_burst(build_ack_frame(seq_num));
+            }
+        }
+        else
+        {
+            Serial.print("❌ BŁĄD RAMKI ");
+            Serial.print(seq_num);
+            Serial.println(" - NACK");
+            delay(50);
+            send_frame_burst(build_nack_frame(seq_num));
+        }
+    }
+    if (USE_SELECTIVE_REPEAT && group_timer_active && !group_complete) {
+
+    unsigned long now = esp_timer_get_time();
+
+    // czas potrzebny na nadanie całej grupy
+    unsigned long group_tx_time_us =
+        BIT_LEN_US * FRAME_LEN * GROUP_SIZE * BURST_COUNT * 1.2;
+
+    if (now - group_start_time_us > group_tx_time_us) {
+
+        Serial.println("⏰ Timeout grupy → NACK");
+
+        // znajdź pierwszą brakującą ramkę
+        int missing_seq = -1;
+        for (int i = 0; i < GROUP_SIZE; i++) {
+            if (!received_frames[i]) {
+                missing_seq = current_group_start + i;
+                break;
+            }
+        }
+
+        if (missing_seq >= 0) {
+            delay(500);
+            Serial.print("📤 Wysyłam NACK dla ramki ");
+            Serial.println(missing_seq);
+            int mask = 0;
+            mask+=8*received_frames[0];
+            mask+=4*received_frames[1];
+            mask+=2*received_frames[2];
+            mask+=received_frames[3];
+            send_frame_burst(build_nack_frame(mask));
+        }
+
+        // reset timera (czekamy na retransmisję)
+        group_timer_active = false;
+    }
+}
+
 }
