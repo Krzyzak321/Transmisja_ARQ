@@ -8,11 +8,15 @@ RX_PIN = 21
 BIT_LEN_US = 990
 
 # --- Tryb korekcji błędów ---
-USE_HAMMING = False
+USE_HAMMING = True
 
 # --- Tryb transmisji ---
 USE_SELECTIVE_REPEAT = True  # True = Selective Repeat, False = Stop-and-Wait
 WINDOW_SIZE = 3  # Rozmiar okna dla Selective Repeat
+
+# --- Burst / powtórzenia ---
+BURST_COUNT = 1              # Ile razy wysyłamy tę samą ramkę pod rząd (ustaw na 2 lub 3)
+INTER_FRAME_GAP_MS = 10      # przerwa między powtórzeniami ramek w ms
 
 # --- Stałe ramki ---
 PREAMBLE_LEN = 16
@@ -22,6 +26,7 @@ HAMMING_PARITY_LEN = 5
 CRC_PARITY_LEN = 4
 PARITY_LEN = HAMMING_PARITY_LEN if USE_HAMMING else CRC_PARITY_LEN
 BITS_AFTER_PREAMBLE = HEADER_LEN + DATA_BITS_LEN + PARITY_LEN
+FRAME_LEN = PREAMBLE_LEN+BITS_AFTER_PREAMBLE
 
 PREAMBLE = "1010101010101010"
 
@@ -45,10 +50,17 @@ DATA_FRAMES = [
     "11001100110011001100110111",  # Ramka 6
     "11001100110011001100111000",  # Ramka 7
     "11001100110011001100111001",  # Ramka 8
+    "11001100110011001100110001",  # Ramka 0
+    "11001100110011001100110010",  # Ramka 1
+    "11001100110011001100110011",  # Ramka 2
+    "11001100110011001100110100",  # Ramka 3
+    "11001100110011001100110101",  # Ramka 4
+    "11001100110011001100110110",  # Ramka 5
+    "11001100110011001100110110",  # Ramka 5 
 ]
 
 # --- Konfiguracja protokołu ---
-ACK_TIMEOUT_MS = 1500
+ACK_TIMEOUT_MS = 3000
 MAX_RETRANSMISSIONS = 3
 
 # --- Inicjalizacja pinów ---
@@ -115,6 +127,13 @@ def build_data_frame(data_bits, seq_num=0):
     parity = calculate_parity(data_bits)
     return PREAMBLE + header + data_bits + parity
 
+def build_data_frame(data_bits, seq_num=0, grup="00"):
+    seq_bits = f"{seq_num:04b}"
+    header = FRAME_TYPE_DATA + seq_bits + grup +"00"
+    parity = calculate_parity(data_bits)
+    return PREAMBLE + header + data_bits + parity
+
+
 def build_ack_frame(seq_num=0):
     seq_bits = f"{seq_num:04b}"
     header = FRAME_TYPE_ACK + seq_bits + "1100"
@@ -137,6 +156,33 @@ def send_bits(bits):
     finally:
         tx.value(0)
         machine.enable_irq(irq_state)
+
+def is_line_idle(required_us=None):
+    # Sprawdź czy linia RX jest nieaktywna (LOW) przez required_us mikrosekund.
+    # Jeśli required_us == None, użyj długości preambuły jako czasu do sprawdzenia.
+    if required_us is None:
+        required_us = PREAMBLE_LEN * BIT_LEN_US
+    start = utime.ticks_us()
+    while utime.ticks_diff(utime.ticks_us(), start) < required_us:
+        if rx.value() == 1:
+            return False
+    return True
+
+def send_frame_burst(bits, burst_count=BURST_COUNT):
+    # Najpierw upewnij się, że linia wolna - jeśli nie, poczekaj krótki losowy backoff
+    attempts = 0
+    while not is_line_idle() and attempts < 5:
+        # prosty pseudo-random backoff (nie wymaga modułu random)
+        delay_ms = (utime.ticks_us() & 0xFF) % 50 + 5
+        utime.sleep_ms(delay_ms)
+        attempts += 1
+
+    for i in range(burst_count):
+        send_bits(bits)
+        # mała przerwa między powtórzeniami, aby druga strona mogła odróżnić powtórzenia
+        utime.sleep_ms(INTER_FRAME_GAP_MS)
+    # po burst ustaw linię low
+    tx.value(0)
 
 def wait_for_preamble(timeout_ms=1000):
     start_time = utime.ticks_ms()
@@ -210,94 +256,97 @@ def verify_frame(frame):
     valid = verify_parity(data, parity)
     
     return frame_type, seq_num, valid
-
-# =========== SELECTIVE REPEAT - GŁÓWNA LOGIKA ===========
+#======================SELECTIVE REPEAT ===========================
 def selective_repeat_transmission():
     total_frames = len(DATA_FRAMES)
-    num_groups = (total_frames + WINDOW_SIZE - 1) // WINDOW_SIZE
+    GROUP_SIZE = 4  # twardo ustawiona liczba ramek w grupie
+    num_groups = (total_frames + GROUP_SIZE - 1) // GROUP_SIZE
     
-    print(f"Rozpoczynam transmisję {total_frames} ramek w {num_groups} grupach")
+    print(f"Rozpoczynam transmisję {total_frames} ramek w {num_groups} grupach po {GROUP_SIZE} ramek")
     
-    for group in range(num_groups):
-        group_start = group * WINDOW_SIZE
-        group_end = min(group_start + WINDOW_SIZE, total_frames)
-        
-        print(f"\n=== GRUPA {group + 1}/{num_groups} (ramki {group_start} do {group_end-1}) ===")
-        
-        # Lista ramek do wysłania w tej grupie
+    group = 0
+    while group < num_groups:
+        group_start = group * GROUP_SIZE
+        group_end = min(group_start + GROUP_SIZE, total_frames)
         frames_to_send = list(range(group_start, group_end))
-        unacked_frames = frames_to_send.copy()
         retry_count = 0
+        group_ack_received=False
         
-        while unacked_frames and retry_count < MAX_RETRANSMISSIONS:
-            print(f"\nPróba {retry_count + 1} dla grupy {group + 1}")
-            print(f"Ramki do potwierdzenia: {unacked_frames}")
+        while group_ack_received==False:
+            print(f"\n=== GRUPA {group + 1}/{num_groups} (ramki {group_start} do {group_end-1}), próba {retry_count + 1} ===")
             
+            # --- Wysyłamy wszystkie ramki w grupie ---
             for seq_num in frames_to_send:
-                if seq_num not in unacked_frames:
-                    continue  # Ramka już potwierdzona
-                    
-                print(f"\n📤 Wysyłam ramkę {seq_num}")
                 data = DATA_FRAMES[seq_num]
-                frame_to_send = build_data_frame(data, seq_num)
-                print(f"Tryb: {'Hamming' if USE_HAMMING else 'CRC-4'}")
-                print(f"Dane: {data}")
-                print(f"Parzystość: {calculate_parity(data)}")
-                send_bits(frame_to_send)
-                
-                # Czekaj na ACK/NACK
-                ack_received = False
-                ack_wait_start = utime.ticks_ms()
-                
-                while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
-                    preamble_time = wait_for_preamble(ACK_TIMEOUT_MS // 2)
-                    if preamble_time is None:
-                        continue
-                    
-                    response_frame = read_frame_after_preamble(preamble_time)
-                    frame_type, resp_seq, valid = verify_frame(response_frame)
-                    
-                    if valid and frame_type in [FRAME_TYPE_ACK, FRAME_TYPE_NACK]:
-                        if resp_seq == seq_num:
-                            if frame_type == FRAME_TYPE_ACK:
-                                print(f"✅ Otrzymano ACK dla ramki {seq_num}")
-                                if seq_num in unacked_frames:
-                                    unacked_frames.remove(seq_num)
-                                ack_received = True
-                            else:
-                                print(f"❌ Otrzymano NACK dla ramki {seq_num}")
-                            break
-                        else:
-                            print(f"⚠️  Otrzymano odpowiedź dla innej ramki ({resp_seq}), ignoruję")
-                    else:
-                        print("⚠️  Odebrano nieprawidłową ramkę odpowiedzi")
-                
-                if not ack_received and seq_num in unacked_frames:
-                    print(f"⏰ Timeout dla ramki {seq_num}")
-                
-                utime.sleep_ms(500)  # Przerwa między ramkami
+                grup="11"
+                if(len(frames_to_send)==4):
+                    grup="11"
+                elif len(frames_to_send) == 3:
+                    grup="10"
+                elif len(frames_to_send) == 2:
+                    grup="01"
+                elif len(frames_to_send) == 1:
+                    grup="00"
+                frame_to_send = build_data_frame(data, seq_num, grup)
+                print(f"📤 Wysyłam ramkę {seq_num} (burst x{BURST_COUNT})")
+                send_frame_burst(frame_to_send, BURST_COUNT)
+                utime.sleep_ms(100)  # krótkie odstępy między ramkami
             
-            # Sprawdź które ramki nadal nie są potwierdzone
-            if unacked_frames:
-                print(f"\nNiepotwierdzone ramki po próbie {retry_count + 1}: {unacked_frames}")
-                retry_count += 1
-                # W następnej próbie wyślij tylko niepotwierdzone ramki
-                frames_to_send = unacked_frames.copy()
-            else:
+            # --- Teraz czekamy na ACK/NACK dla całej grupy ---
+            print("👂 Nasłuchiwanie odpowiedzi dla grupy...")
+            group_ack_received = False
+            ack_wait_start = utime.ticks_us()
+            
+            while utime.ticks_diff(utime.ticks_us(), ack_wait_start) < 1000*ACK_TIMEOUT_MS+BIT_LEN_US*FRAME_LEN*(4-len(frames_to_send)):
+                preamble_time = wait_for_preamble(ACK_TIMEOUT_MS // 2)
+                if preamble_time is None:
+                    continue
+                
+                response_frame = read_frame_after_preamble(preamble_time)
+                frame_type, resp_seq, valid = verify_frame(response_frame)
+                
+                if not valid:
+                    print("⚠️ Odebrano nieprawidłową ramkę odpowiedzi")
+                    continue
+                
+                # Sprawdzenie, czy odpowiedź dotyczy tej grupy
+                if frame_type == FRAME_TYPE_ACK:
+                    # Jeśli ACK obejmuje ostatnią ramkę grupy → cała grupa OK
+                    if resp_seq in frames_to_send:
+                        print(f"✅ Otrzymano ACK dla grupy {group + 1} (ramka {resp_seq})")
+                        group_ack_received = True
+                        break
+                elif frame_type == FRAME_TYPE_NACK:
+                    #if resp_seq in frames_to_send:
+                        mask='{0:04b}'.format(resp_seq)
+                        print(f"❌ Otrzymano NACK - Brakuje ramek: {mask}")
+                        frames_to_send = []
+                        
+                        for i in range(4):
+                            if mask[i]=='0':
+                                frames_to_send.append(group_start+i)
+                        group_ack_received = False
+                        break
+            
+            if group_ack_received:
                 print(f"✅ Wszystkie ramki w grupie {group + 1} potwierdzone")
-                break
+                break  # przechodzimy do kolejnej grupy
+            else:
+                retry_count += 1
+                print(f"🔄 Retransmisja grupy {group + 1} (próba {retry_count + 1})")
+                utime.sleep_ms(500)  # krótka przerwa przed retransmisją
         
-        if unacked_frames:
-            print(f"🛑 Nie udało się przesłać ramek {unacked_frames} po {MAX_RETRANSMISSIONS} próbach")
-            # Kontynuuj z następną grupą
-            unacked_frames.clear()
+        if retry_count == MAX_RETRANSMISSIONS:
+            print(f"🛑 Nie udało się przesłać grupy {group + 1} po {MAX_RETRANSMISSIONS} próbach")
         
-        utime.sleep_ms(2000)  # Przerwa między grupami
+        group += 1
+        utime.sleep_ms(1000)  # przerwa między grupami
     
     print("\n" + "="*50)
     print("TRANSMISJA ZAKOŃCZONA")
     print(f"Wysłano {total_frames} ramek w {num_groups} grupach")
     print("="*50)
+
 
 # =========== STOP-AND-WAIT - GŁÓWNA LOGIKA ===========
 def stop_and_wait_transmission():
@@ -316,7 +365,7 @@ def stop_and_wait_transmission():
         print(f"Parzystość: {calculate_parity(data)}")
         
         print("📤 Wysyłam ramkę...")
-        send_bits(frame_to_send)
+        send_frame_burst(frame_to_send, BURST_COUNT)
         
         # Czekaj na ACK
         ack_received = False
@@ -347,7 +396,7 @@ def stop_and_wait_transmission():
                 retry_count += 1
                 if retry_count < MAX_RETRANSMISSIONS:
                     print(f"🔄 Retransmisja ramki {seq_num}")
-                    send_bits(frame_to_send)
+                    send_frame_burst(frame_to_send, BURST_COUNT)
                 else:
                     print(f"🛑 Przekroczono maksymalną liczbę retransmisji dla ramki {seq_num}")
                     seq_num += 1  # Przejdź do następnej ramki mimo braku ACK
@@ -366,6 +415,7 @@ print(f"Tryb transmisji: {'Selective Repeat' if USE_SELECTIVE_REPEAT else 'Stop-
 print(f"Rozmiar okna: {WINDOW_SIZE}")
 print(f"Maksymalna liczba retransmisji: {MAX_RETRANSMISSIONS}")
 print(f"Liczba ramek do wysłania: {len(DATA_FRAMES)}")
+print(f"BURST_COUNT: {BURST_COUNT}, INTER_FRAME_GAP_MS: {INTER_FRAME_GAP_MS}")
 
 while True:
     if USE_SELECTIVE_REPEAT:
@@ -375,3 +425,4 @@ while True:
     
     print("\n🔁 Rozpoczynam nową transmisję za 5 sekund...")
     utime.sleep(5)
+
