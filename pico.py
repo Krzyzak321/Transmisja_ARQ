@@ -8,7 +8,7 @@ RX_PIN = 21
 BIT_LEN_US = 990
 
 # --- Tryb korekcji błędów ---
-USE_HAMMING = True
+USE_HAMMING = False
 
 # --- Tryb transmisji ---
 USE_SELECTIVE_REPEAT = True  # True = Selective Repeat, False = Stop-and-Wait
@@ -41,23 +41,28 @@ NACK_DATA = "0" * DATA_BITS_LEN
 
 # --- Dane testowe (9 ramek do wysłania) ---
 DATA_FRAMES = [
-    "11001100110011001100110001",  # Ramka 0
-    "11001100110011001100110010",  # Ramka 1
-    "11001100110011001100110011",  # Ramka 2
-    "11001100110011001100110100",  # Ramka 3
-    "11001100110011001100110101",  # Ramka 4
-    "11001100110011001100110110",  # Ramka 5
-    "11001100110011001100110111",  # Ramka 6
-    "11001100110011001100111000",  # Ramka 7
-    "11001100110011001100111001",  # Ramka 8
-    "11001100110011001100110001",  # Ramka 0
-    "11001100110011001100110010",  # Ramka 1
-    "11001100110011001100110011",  # Ramka 2
-    "11001100110011001100110100",  # Ramka 3
-    "11001100110011001100110101",  # Ramka 4
-    "11001100110011001100110110",  # Ramka 5
-    "11001100110011001100110110",  # Ramka 5 
+    "10000000000000000000000000",  # Ramka 1
+    "11000000000000000000000000",  # Ramka 2
+    "11100000000000000000000000",  # Ramka 3
+    "11110000000000000000000000",  # Ramka 4
+    "11111000000000000000000000",  # Ramka 5
+    "11111100000000000000000000",  # Ramka 6
+    "11111110000000000000000000",  # Ramka 7
+    "11111111000000000000000000",  # Ramka 8
+    "11111111100000000000000000",  # Ramka 9
+    "11111111110000000000000000",  # Ramka 10
+    "11111111111000000000000000",  # Ramka 11
+    "11111111111100000000000000",  # Ramka 12
+    "11111111111110000000000000",  # Ramka 13
+    "11111111111111000000000000",  # Ramka 14
+    "11111111111111100000000000",  # Ramka 15	
+    "11111111111111110000000000",  # Ramka 16
 ]
+
+
+retransmission_count = 0
+acks=0
+nacks=0
 
 # --- Konfiguracja protokołu ---
 ACK_TIMEOUT_MS = 3000
@@ -183,63 +188,94 @@ def send_frame_burst(bits, burst_count=BURST_COUNT):
         utime.sleep_ms(INTER_FRAME_GAP_MS)
     # po burst ustaw linię low
     tx.value(0)
-
 def wait_for_preamble(timeout_ms=1000):
-    start_time = utime.ticks_ms()
+    start_waiting = utime.ticks_ms()
     bit_count = 0
     last_state = rx.value()
-    last_edge = utime.ticks_us()
-
-    while utime.ticks_diff(utime.ticks_ms(), start_time) < timeout_ms:
+    # Zmienne do pomiaru czasu trwania całej preambuły
+    preamble_start_time = 0 
+    
+    while utime.ticks_diff(utime.ticks_ms(), start_waiting) < timeout_ms:
         current = rx.value()
         if current != last_state:
             now = utime.ticks_us()
-            pulse_width = utime.ticks_diff(now, last_edge)
-            if pulse_width > BIT_LEN_US * 0.4 and pulse_width < BIT_LEN_US * 1.6:
-                sample_time = utime.ticks_add(last_edge, pulse_width // 2)
-                while utime.ticks_diff(sample_time, utime.ticks_us()) > 0:
-                    pass
-                sampled = rx.value()
-                expected = PREAMBLE[bit_count]
-                if (expected == '1' and sampled == 1) or (expected == '0' and sampled == 0):
+            # Jeśli to pierwszy bit preambuły, zapisz czas startu
+            if bit_count == 0:
+                preamble_start_time = now
+            
+            # Mierzymy czas od ostatniego zbocza
+            # Uwaga: w pierwszym obiegu last_edge może być stary, ale bit_count zresetuje się
+            # jeśli pulse_width będzie bez sensu, więc to ok.
+            
+            # Tutaj uproszczona logika detekcji 1010...
+            # Zakładamy, że zbocze następuje co BIT_LEN
+            # W idealnym świecie zbocza są co ~990us
+            
+            # W tym miejscu po prostu czekamy na sekwencję 16 zmian stanu
+            # pasujących do wzorca czasowego (0.5x do 1.5x BIT_LEN)
+            pulse_width = utime.ticks_diff(now, preamble_start_time if bit_count == 0 else last_edge)
+            
+            # Jeśli to nie pierwszy bit, sprawdzamy czy szerokość impulsu ma sens
+            if bit_count > 0:
+                if pulse_width > BIT_LEN_US * 0.5 and pulse_width < BIT_LEN_US * 1.5:
                     bit_count += 1
-                    if bit_count == PREAMBLE_LEN:
-                        return now
                 else:
+                    # Zły timing - reset
                     bit_count = 0
+                    # Jeśli obecny stan to '1' (początek preambuły), to może to być nowy start
+                    if current == 1: 
+                        bit_count = 1
+                        preamble_start_time = now
             else:
-                bit_count = 0
-
+                # Czekamy na '1' jako start preambuły
+                if current == 1:
+                    bit_count = 1
+                    preamble_start_time = now
+            
             last_edge = now
             last_state = current
+            
+            if bit_count == PREAMBLE_LEN:
+                # Sukces! Obliczamy rzeczywisty czas trwania bitu
+                total_duration = utime.ticks_diff(now, preamble_start_time)
+                # Dzielimy przez (PREAMBLE_LEN - 1) bo mierzymy od zbocza do zbocza
+                # Ale bezpieczniej przyjąć średnią z całości.
+                # Preambuła ma 16 bitów, czyli 16 okresów "stanu"? 
+                # Nie, 1010... to 16 bitów czasu.
+                # Czas od pierwszego zbocza (start bitu 0) do ostatniego zbocza (koniec bitu 15)
+                # to około 15.5 bitu lub 16 bitów zależnie jak łapiemy.
+                # Uprośćmy: duration / (PREAMBLE_LEN - 0.5) daje niezły wynik
+                actual_bit_len = total_duration / (PREAMBLE_LEN - 0.5)
+                return now, actual_bit_len
 
-        if utime.ticks_diff(utime.ticks_us(), last_edge) > BIT_LEN_US * 3:
-            bit_count = 0
-            last_state = rx.value()
-            last_edge = utime.ticks_us()
+    return None, None
 
-    return None
-
-def read_frame_after_preamble(preamble_ts):
+def read_frame_after_preamble(preamble_end_ts, actual_bit_len):
     frame = ""
     bits_to_read = BITS_AFTER_PREAMBLE
-
-    first_sample = utime.ticks_add(preamble_ts, BIT_LEN_US)
-    first_sample = utime.ticks_add(first_sample, int(BIT_LEN_US * 0.5))
-
-    while utime.ticks_diff(first_sample, utime.ticks_us()) > 0:
-        pass
-
-    t = first_sample
+    
+    # Używamy zmierzonej długości bitu zamiast stałej BIT_LEN_US!
+    # Ustawiamy punkt próbkowania na 0.5 lub 1.5 bitu od ostatniego zbocza preambuły
+    # Ostatnie zbocze preambuły to koniec bitu "0" (jeśli preambuła kończy się zerem).
+    # Następny bit zaczyna się od razu.
+    
+    # Startujemy od punktu "teraz" (koniec preambuły)
+    next_sample_time = utime.ticks_add(preamble_end_ts, int(actual_bit_len * 0.5))
+    
+    # Musimy uwzględnić, że funkcja wait_for_preamble trochę trwałą i 'now' jest lekko w przeszłości
+    # ale ticks_diff sobie z tym poradzi.
+    
     for i in range(bits_to_read):
+        # Przesuwamy się o 1 pełny (zmierzony) bit
+        next_sample_time = utime.ticks_add(next_sample_time, int(actual_bit_len))
+        
+        # Czekamy aktywnie na ten moment
+        while utime.ticks_diff(next_sample_time, utime.ticks_us()) > 0:
+            pass
+            
         frame += '1' if rx.value() else '0'
-        t = utime.ticks_add(t, BIT_LEN_US)
-        if i < bits_to_read - 1:
-            while utime.ticks_diff(t, utime.ticks_us()) > 0:
-                pass
 
     return frame
-
 def verify_frame(frame):
     expected_len = HEADER_LEN + DATA_BITS_LEN + PARITY_LEN
     if len(frame) != expected_len:
@@ -258,6 +294,9 @@ def verify_frame(frame):
     return frame_type, seq_num, valid
 #======================SELECTIVE REPEAT ===========================
 def selective_repeat_transmission():
+    global retransmission_count
+    global acks
+    global nacks
     total_frames = len(DATA_FRAMES)
     GROUP_SIZE = 4  # twardo ustawiona liczba ramek w grupie
     num_groups = (total_frames + GROUP_SIZE - 1) // GROUP_SIZE
@@ -272,7 +311,8 @@ def selective_repeat_transmission():
         retry_count = 0
         group_ack_received=False
         
-        while group_ack_received==False:
+        #while group_ack_received==False:
+        while retry_count<MAX_RETRANSMISSIONS:
             print(f"\n=== GRUPA {group + 1}/{num_groups} (ramki {group_start} do {group_end-1}), próba {retry_count + 1} ===")
             
             # --- Wysyłamy wszystkie ramki w grupie ---
@@ -298,28 +338,28 @@ def selective_repeat_transmission():
             ack_wait_start = utime.ticks_us()
             
             while utime.ticks_diff(utime.ticks_us(), ack_wait_start) < 1000*ACK_TIMEOUT_MS+BIT_LEN_US*FRAME_LEN*(4-len(frames_to_send)):
-                preamble_time = wait_for_preamble(ACK_TIMEOUT_MS // 2)
-                if preamble_time is None:
+                preamble_end, real_bit_len = wait_for_preamble(ACK_TIMEOUT_MS // 2)
+                if preamble_end is None:
                     continue
                 
-                response_frame = read_frame_after_preamble(preamble_time)
+                response_frame = read_frame_after_preamble(preamble_end, real_bit_len)
                 frame_type, resp_seq, valid = verify_frame(response_frame)
                 
-                if not valid:
-                    print("⚠️ Odebrano nieprawidłową ramkę odpowiedzi")
-                    continue
+        
                 
                 # Sprawdzenie, czy odpowiedź dotyczy tej grupy
                 if frame_type == FRAME_TYPE_ACK:
                     # Jeśli ACK obejmuje ostatnią ramkę grupy → cała grupa OK
                     if resp_seq in frames_to_send:
                         print(f"✅ Otrzymano ACK dla grupy {group + 1} (ramka {resp_seq})")
+                        acks+=1
                         group_ack_received = True
                         break
                 elif frame_type == FRAME_TYPE_NACK:
                     #if resp_seq in frames_to_send:
                         mask='{0:04b}'.format(resp_seq)
                         print(f"❌ Otrzymano NACK - Brakuje ramek: {mask}")
+                        nacks+=1
                         frames_to_send = []
                         
                         for i in range(4):
@@ -334,8 +374,12 @@ def selective_repeat_transmission():
             else:
                 retry_count += 1
                 print(f"🔄 Retransmisja grupy {group + 1} (próba {retry_count + 1})")
+                retransmission_count+=1
                 utime.sleep_ms(500)  # krótka przerwa przed retransmisją
-        
+                
+            if not valid:
+                    print("⚠️ Odebrano nieprawidłową ramkę odpowiedzi")
+                    continue
         if retry_count == MAX_RETRANSMISSIONS:
             print(f"🛑 Nie udało się przesłać grupy {group + 1} po {MAX_RETRANSMISSIONS} próbach")
         
@@ -345,11 +389,17 @@ def selective_repeat_transmission():
     print("\n" + "="*50)
     print("TRANSMISJA ZAKOŃCZONA")
     print(f"Wysłano {total_frames} ramek w {num_groups} grupach")
+    print(f"==============\n Laczna liczba retransmisji: {retransmission_count}\n================")
+    print(f"Odebrane ACK: {acks}")
+    print(f"Odebrane NACK: {nacks}")
     print("="*50)
 
 
 # =========== STOP-AND-WAIT - GŁÓWNA LOGIKA ===========
 def stop_and_wait_transmission():
+    global retransmission_count
+    global acks
+    global nacks
     total_frames = len(DATA_FRAMES)
     seq_num = 0
     
@@ -376,26 +426,29 @@ def stop_and_wait_transmission():
             ack_wait_start = utime.ticks_ms()
             
             while utime.ticks_diff(utime.ticks_ms(), ack_wait_start) < ACK_TIMEOUT_MS:
-                preamble_time = wait_for_preamble(ACK_TIMEOUT_MS // 2)
-                if preamble_time is None:
+                preamble_end, real_bit_len = wait_for_preamble(ACK_TIMEOUT_MS // 2)
+                if preamble_end is None:
                     continue
                 
-                response_frame = read_frame_after_preamble(preamble_time)
+                response_frame = read_frame_after_preamble(preamble_end, real_bit_len)
                 frame_type, resp_seq, valid = verify_frame(response_frame)
                 
                 if valid and frame_type == FRAME_TYPE_ACK and resp_seq == seq_num:
                     print(f"✅ Otrzymano ACK dla ramki {seq_num}")
+                    acks+=1
                     ack_received = True
                     seq_num += 1
                     break
                 elif valid and frame_type == FRAME_TYPE_NACK and resp_seq == seq_num:
                     print(f"❌ Otrzymano NACK dla ramki {seq_num}")
+                    nacks+=1
                     break
             
             if not ack_received:
                 retry_count += 1
                 if retry_count < MAX_RETRANSMISSIONS:
                     print(f"🔄 Retransmisja ramki {seq_num}")
+                    retransmission_count+=1
                     send_frame_burst(frame_to_send, BURST_COUNT)
                 else:
                     print(f"🛑 Przekroczono maksymalną liczbę retransmisji dla ramki {seq_num}")
@@ -406,6 +459,9 @@ def stop_and_wait_transmission():
     print("\n" + "="*50)
     print("TRANSMISJA ZAKOŃCZONA")
     print(f"Wysłano {total_frames} ramek")
+    print(f"==============\n Laczna liczba retransmisji: {retransmission_count}\n================")
+    print(f"Odebrane ACK: {acks}")
+    print(f"Odebrane NACK: {nacks}")
     print("="*50)
 
 # =========== GŁÓWNA PĘTLA ===========
@@ -425,4 +481,3 @@ while True:
     
     print("\n🔁 Rozpoczynam nową transmisję za 5 sekund...")
     utime.sleep(5)
-
