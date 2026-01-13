@@ -1,85 +1,93 @@
-# Transmisja ARQ (ESP32 <-> Raspberry Pi Pico) — zwięzłe podsumowanie
+# ARQ (ESP32 ↔ Raspberry Pi Pico)
 
-Ten README opisuje aktualny stan implementacji dwóch plików dostarczonych poniżej: `esp32.ino` (ESP32, odbiornik/ACK) oraz `pico.py` (Raspberry Pi Pico, nadajnik/tx+rx w MicroPython). Opis jest celowo krótki i praktyczny — skupia się na tym, co robi kod, jakie są kluczowe parametry i gdzie można łatwo rozbudować projekt (CRC‑8, inne protokoły ARQ).
+Podsumowanie projektu: prosty protokół ARQ (ACK/NACK) nadawany przez GPIO (np. 433 MHz TX/RX moduły). Repo zawiera implementacje po stronie odbiorcy (ESP32) i nadajnika (Raspberry Pi Pico, MicroPython).
 
-## Krótkie podsumowanie
-- Mechanizm: Stop‑and‑Wait ARQ (nadajnik wysyła ramkę → oczekuje ACK/NACK → ewentualna retransmisja).
-- Kontrola błędów: Hamming (31,26) — 26 bitów danych + 5 bitów parzystości.
-- Nośnik fizyczny: proste nadajniki/odbiorniki 433 MHz, sterowane GPIO (bit timing software).
-- Główne pliki:
-  - esp32.ino — odbiornik, detekcja preambuły, odczyt ramki, weryfikacja, wysyłanie ACK/NACK.
-  - pico.py — nadajnik, budowa ramek Hamming, wysyłka bitów, oczekiwanie na ACK z synchronizacją.
+## Pliki
+- `esp32.ino` — odbiornik (ESP32): detekcja preambuły, odczyt ramki, weryfikacja (Hamming/CRC), wysyłanie ACK/NACK.
+- `pico.py` — nadajnik (Raspberry Pi Pico, MicroPython): generowanie ramek, wysyłka, oczekiwanie na ACK/NACK, Selective Repeat / Stop-and-Wait.
 
-## Struktura ramki
-- Preambuła: 16 bitów, stała = "1010101010101010"
-- Nagłówek: 12 bitów (4 bity typ ramki, 4 bity numer sekwencji, 3 bity długość, 1 bit rezerwa)
+## Krótkie założenia
+- Medium: GPIO sterujące nadajnikiem/odbiornikiem (np. 433 MHz).
+- Synchronizacja bitów: software timing (BIT_LEN_US ~ 990 µs domyślnie).
+- ARQ: Stop‑and‑Wait lub Selective‑Repeat (konfigurowalne).
+- FEC: Hamming(31,26) (5 bitów parzystości) lub CRC‑4 (4 bity) — wybieralne w kodzie.
+
+## Struktura ramki 
+- Preambuła: 16 bitów — `1010101010101010`
+- Nagłówek: 12 bitów:
+  - 4 bity — typ ramki (DATA / ACK / NACK)
+  - 4 bity — numer sekwencji (seq)
+  - 3 bity — długość/grupa (grupowanie w Selective Repeat)
+  - 1 bit — rezerwa
 - Dane: 26 bitów
-- Parzystość: 5 bitów (Hamming)
-- Długość po preambule = HEADER_LEN + DATA_BITS_LEN + HAMMING_PARITY_LEN (w kodzie stałe)
+- Parzystość: Hamming = 5 bitów lub CRC‑4 = 4 bity (w zależności od konfiguracji)
 
-## Piny i timing (domyślne w kodzie)
-- ESP32: RX_PIN = 21, TX_PIN = 47
-- Pico: TX_PIN = 15, RX_PIN = 21
-- BIT_LEN_US ≈ 990 μs — czas trwania bitu (wartość kluczowa do dopasowania)
-- ESP32 ma dodatkowy parametr BIT_READ_DELAY_US (optymalne opóźnienie przy odczycie)
+ACK / NACK: payload to stała sekwencja (ACK = wszystkie `1`, NACK = wszystkie `0`) + parzystość.
 
-## Kluczowe funkcje — co robią (najważniejsze miejsca w kodzie)
+## Domyślne piny i timing
+- ESP32:
+  - RX_PIN = 21, TX_PIN = 47
+  - BIT_LEN_US = 990, BIT_READ_DELAY_US (opóźnienie próbkowania)
+- Pico:
+  - TX_PIN = 15, RX_PIN = 21
+  - BIT_LEN_US = 990
+Uwaga: dostosuj piny i BIT_LEN_US do sprzętu i jakości łącza RF.
 
-ESP32 (esp32.ino)
-- calculate_hamming_parity(data) — tworzy 5‑bitową parzystość Hamminga dla 26 bitów danych.
-- verify_hamming(data, parity) — porównuje obliczoną parzystość z odebraną.
-- wait_for_preamble() — prosty detektor preambuły: czeka na krawędzie, przesuwa próbkę do środka bitu i porównuje sekwencję.
-- read_frame_after_preamble() — po wykryciu preambuły odczytuje kolejne bity, próbkowane w środku ich trwania.
-- introduce_random_errors(frame, p) — (testowo) losowo flipuje bity po preambule, by symulować błędy.
-- send_bits(bits) — wysyła bity przez TX pin, z opóźnieniem BIT_LEN_US.
-- build_ack_frame()/build_nack_frame() — budują ramki ACK/NACK z preambułą + header + stały payload + parzystość.
+## Tryby działania (jak przełączać)
+- Hamming vs CRC: ustaw `USE_HAMMING = True/False` w obu plikach.
+- ARQ: `USE_SELECTIVE_REPEAT = True/False` (Pico i ESP32 muszą zgadzać się co do trybu).
+- Parametry okna: `WINDOW_SIZE`, `GROUP_SIZE`, `BURST_COUNT`, `INTER_FRAME_GAP_MS`, `ACK_TIMEOUT_MS` — edytuj w plikach.
 
-Pico (pico.py)
-- calculate_hamming_parity(data) / verify_hamming(...) — analogicznie jak w ESP32 (wersje w Pythonie).
-- build_data_frame(seq_num) / build_ack_frame() / build_nack_frame() — konstruują ramki do nadania.
-- send_bits(bits) — wyłącza przerwania (stabilność timingowa) i nadaje bity przez GPIO z utime.sleep_us(BIT_LEN_US).
-- wait_for_preamble(timeout) — wykrywa preambułę mierząc odstępy między krawędziami i sprawdzając próbki po środku impulsów; zwraca timestamp końca preambuły.
-- read_frame_after_preamble(preamble_ts) — wyrównane próbkowanie do środków bitów zaczynając od preamble_ts + 1*BIT_LEN_US + 0.5*BIT_LEN_US.
-- verify_frame(frame) — sprawdza długość i parzystość.
+## Jak to działa – skrót
+Sender (Pico):
+1. Buduje `DATA` frame (preambuła + header + data + parity).
+2. Wysyła ramki (może wysyłać grupy — Selective Repeat — lub pojedynczo).
+3. Czeka na ACK/NACK: wykrywa preambułę, odczytuje ramkę odpowiedzi, weryfikuje.
+4. Jeśli ACK → przechodzi dalej; jeśli NACK → retransmituje brakujące ramki lub całą grupę.
 
-## Główny przebieg (sender — Pico)
-1. build_data_frame(seq) → send_bits(frame).
-2. Czekaj na ACK w pętli z timeoutem ACK_TIMEOUT_MS:
-   - wait_for_preamble() — synchronizacja; jeśli znaleziono, read_frame_after_preamble(preamble_ts).
-   - verify_frame(ack_frame) → sprawdź typ w nagłówku (ACK/NACK).
-3. Jeśli ACK → inkrementuj numer sekwencji; jeśli brak → retransmituj (licznik retransmisji).
-4. Pauza między transmisjami (utime.sleep_ms).
+Receiver (ESP32):
+1. Nasłuchuje na preambułę (przez detekcję zboczy i próbkowanie w środku bitu).
+2. Odczytuje header + data + parity, weryfikuje (Hamming/CRC).
+3. Jeśli OK → wysyła ACK (może wysyłać burst); jeśli nie → wysyła NACK (maską/seq wskazuje brakujące ramki).
 
-Główne przebiegi (receiver — ESP32)
-1. wait_for_preamble(); po wykryciu → read_frame_after_preamble().
-2. verify_frame(frame) → jeśli OK → send_bits(build_ack_frame()); w przeciwnym razie send_bits(build_nack_frame()).
-3. (Opcjonalnie) podczas testów wprowadź błędy do odebranej ramki, żeby sprawdzić ARQ.
-
-## Jak i gdzie rozszerzać projekt (krótkie wskazówki)
-- Dodanie CRC‑8:
-  - Dodaj funkcję calculate_crc8(data) w obu plikach; w funkcji build_*_frame wstaw CRC zamiast bitów Hamminga (lub w dodatkowym polu).
-  - W verify_frame sprawdzaj CRC zamiast/obok Hamminga.
-- Obsługa innych protokołów ARQ:
-  - Wydziel logikę ARQ z pętli głównej do oddzielnego modułu (np. arq.py / arq.cpp), żeby później podmienić Stop‑and‑Wait na Go‑Back‑N lub Selective‑Repeat.
-  - Zwiększ liczbę bitów numeru sekwencji w nagłówku, jeśli planujesz okna większe niż 16.
-- Uporządkowanie kodu:
-  - Wydziel moduły: phy (GPIO/timing), frame (parsowanie/konstrukcja), fec (Hamming/CRC), arq (logika retransmisji).
-- Strojenie timingów:
-  - BIT_LEN_US i BIT_READ_DELAY_US dostosuj do jakości łącza RF i opóźnień platformy. Testuj z `introduce_random_errors` aby zmierzyć odporność.
+NACK maska: 4‑bitowy mask (w implementacji) określający które ramki grupy są obecne; nadajnik interpretuje `0` jako brak i retransmituje te ramki.
 
 ## Testy i debug
-- Oba programy logują informacje (Serial.print / print): wykrycie preambuły, zmierzony czas, odebrane pola, parzystości.
-- Użyj `introduce_random_errors` (ESP32) oraz testowych danych w Pico, by sprawdzić zachowanie retransmisji.
-- Jeśli występują fałszywe detekcje preambuły lub błędy synchronizacji, spróbuj:
-  - Zwiększyć/zmniejszyć BIT_LEN_US,
-  - Dostosować BIT_READ_DELAY_US,
-  - Zmienić preambułę na dłuższą lub bardziej odporne sekwencje (np. Barker).
+- W ESP32 jest funkcja testowa `introduce_random_errors(frame, p)` — użyj jej, by zasymulować błędy i testować ARQ.
+- Logi: `Serial.print` / `print` informują o:
+  - wykryciu preambuły,
+  - numerze sekwencji,
+  - wyniku weryfikacji (naprawiono błąd Hamming / CRC fail),
+  - wysłanych ACK/NACK i liczbie retransmisji.
+- Jeśli pojawiają się fałszywe preambuły / złe synchronizacje:
+  - dopasuj BIT_LEN_US,
+  - zwiększ preambułę lub zmień sekwencję (np. Barker),
+  - dopasuj BIT_READ_DELAY_US na ESP32.
 
-## Uruchomienie (szybkie)
-- Wgraj `esp32.ino` do ESP32 (ustaw RX/TX pin zgodnie ze sprzętem).
-- Wgraj `pico.py` na Raspberry Pi Pico (MicroPython), ustaw piny zgodnie z połączeniami.
-- Otwórz terminaly szeregowe obu urządzeń (115200) i obserwuj logi — nadajnik wysyła, odbiornik odpowiada ACK/NACK.
+## Strojenie i wskazówki praktyczne
+- Najważniejszy parametr: BIT_LEN_US — zależy od jakości łącza RF i dokładności timera platformy.
+- Bursty: ustaw `BURST_COUNT = 2..3`, jeśli sygnał jest niestabilny.
+- Linia idle: przed wysyłką sprawdź `is_line_idle()` (kod ma prosty backoff).
+- Wspólna konfiguracja: upewnij się, że oba urządzenia mają ten sam tryb korekcji i te same wartości timingowe.
 
----
+## Rozszerzenia (gdzie warto rozbudować)
+- Dodać CRC‑8 lub CRC‑16 zamiast/obok Hamming:
+  - dodać `calculate_crc8(...)` w obu plikach i użyć jako `calculate_parity`.
+- Uporządkować kod modularnie:
+  - moduły: `phy` (GPIO/timing), `frame` (parsowanie/konstrukcja), `fec` (Hamming/CRC), `arq` (logika retransmisji).
+- Inne ARQ: dodać Go‑Back‑N lub alternatyczne heurystyki transmisji.
+- Większe okno: zwiększyć liczbę bitów numeru sekwencji (obecnie 4 bity = 0–15).
 
-Plików nie modyfikuję tutaj — to zwięzłe wyjaśnienie ich działania i miejsc, gdzie warto dodać CRC‑8 i nowe protokoły ARQ. Jeśli chcesz, przygotuję wersję README z dodatkowymi przykładami komend do testów lub szablonem modułowej struktury kodu (krótki plan plików i zależności).
+## Szybkie komendy (upraszczające wgrywanie)
+- ESP32: wgraj `esp32.ino` z Arduino IDE lub Arduino CLI.
+- Pico: wrzuć `pico.py` na urządzenie przez Thonny / rshell / ampy.
+
+Przykład (Thonny): otwórz urządzenie → zapisz jako `main.py` lub `pico.py` na PICO.
+Przykład (Arduino IDE): potrzeba dodać rozszerzenie od espressif systems ustawić odpowiednio ustawienei urządzenie w zalezności od wersji esp i wysłać do urządzenia
+
+## Czego oczekiwać i testy
+- Po wgraniu: otwórz oba terminale szeregowe (115200). Nadajnik zacznie wysyłać ramki, odbiornik będzie logował preambułę, weryfikacje oraz wysyłał ACK/NACK.
+- Obserwuj licznik retransmisji oraz ilość odebranych ACK/NACK.
+
+## Autorzy
+Kacper😶‍🌫️, Maciek🥀

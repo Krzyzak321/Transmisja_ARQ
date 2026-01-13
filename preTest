@@ -7,10 +7,10 @@ const int TX_PIN = 47;
 const unsigned long BIT_LEN_US = 990;
 const unsigned long BIT_READ_DELAY_US = 1030;
 
-const bool USE_HAMMING = true;
+const bool USE_HAMMING = false;
 const bool USE_SELECTIVE_REPEAT = true;
 const int WINDOW_SIZE = 3;
-const int BURST_COUNT = 6;
+const int BURST_COUNT = 3;
 const int INTER_FRAME_GAP_MS = 10;
 
 const int PREAMBLE_LEN = 16;
@@ -424,22 +424,6 @@ void loop()
                     }
                 }
 
-                if (group_complete)
-                {
-                    int last_seq = current_group_start + GROUP_SIZE - 1;
-                    unsigned long wait_us = BIT_LEN_US * FRAME_LEN * GROUP_SIZE * 2.5;
-                    Serial.print("⏱️ Czekam ");
-                    Serial.print(wait_us / 1000);
-                    Serial.println(" us przed ACK...");
-                    delayMicroseconds(wait_us);
-                    Serial.print("📤 Wysyłam ACK dla grupy ");
-                    Serial.print(current_group_start);
-                    Serial.print("-");
-                    Serial.println(last_seq);
-                    send_frame_burst(build_ack_frame(last_seq));
-                    group_timer_active = false;
-                }
-
                 if (group_complete && seq_num >= current_group_start + GROUP_SIZE)
                 {
                     current_group_start += GROUP_SIZE;
@@ -453,6 +437,31 @@ void loop()
                     Serial.print("➕ Dodano ramkę ");
                     Serial.println(seq_num);
                 }
+
+                else if (group_complete)
+                {
+                    int last_seq = current_group_start + GROUP_SIZE - 1;
+                    int frames_left =
+                    (current_group_start + GROUP_SIZE - 1) - seq_num;
+
+                    if (frames_left <= 0) frames_left = 1;
+                    if (frames_left > GROUP_SIZE) frames_left = GROUP_SIZE;
+                    unsigned long wait_us = BIT_LEN_US * FRAME_LEN *frames_left * 12;
+                    Serial.print("⏱️ Czekam ");
+                    Serial.println("zostalo: ");
+                    Serial.print(frames_left);
+                    Serial.print(wait_us / 1000);
+                    Serial.println(" us przed ACK...");
+                    delayMicroseconds(wait_us);
+                    Serial.print("📤 Wysyłam ACK dla grupy ");
+                    Serial.print(current_group_start);
+                    Serial.print("-");
+                    Serial.println(last_seq);
+                    send_frame_burst(build_ack_frame(last_seq));
+                    group_timer_active = false;
+                }
+
+    
             
             }
             else

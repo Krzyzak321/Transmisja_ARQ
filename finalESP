@@ -7,10 +7,10 @@ const int TX_PIN = 47;
 const unsigned long BIT_LEN_US = 990;
 const unsigned long BIT_READ_DELAY_US = 1030;
 
-const bool USE_HAMMING = true;
+const bool USE_HAMMING = false;
 const bool USE_SELECTIVE_REPEAT = true;
 const int WINDOW_SIZE = 3;
-const int BURST_COUNT = 6;
+const int BURST_COUNT = 3;
 const int INTER_FRAME_GAP_MS = 10;
 
 const int PREAMBLE_LEN = 16;
@@ -29,6 +29,11 @@ const String FRAME_TYPE_NACK = "0011";
 
 const String ACK_DATA = "11111111111111111111111111";
 const String NACK_DATA = "00000000000000000000000000";
+
+
+int ack_count=0;
+int nack_count=0;
+String received_frames2[16];
 
 String calculate_crc4(const String &data)
 {
@@ -313,6 +318,7 @@ String read_frame_after_preamble()
     return frame;
 }
 
+int ileOdebranych = 0;
 bool verify_frame(String &frame, int &seq_num, int &gg_num)
 {
     if (frame.length() != HEADER_LEN + DATA_BITS_LEN + PARITY_LEN)
@@ -334,13 +340,21 @@ bool verify_frame(String &frame, int &seq_num, int &gg_num)
     {
         frame = header + data + parity;
     }
+    bool isThere = false;
+    for( String framee : received_frames2){
+        if(framee.substring(0, HEADER_LEN)==header){
+            isThere=true;
+            break;
+        }
+    }
+    if(!isThere){received_frames2[ileOdebranych]=frame; ileOdebranych++;}
     return ok;
 }
 
-String introduce_random_errors(const String &frame, float error_probability = 0.1)
+String introduce_random_errors(const String &frame, float error_probability = 0.01)
 {
     String corrupted = frame;
-    for (int i = PREAMBLE_LEN; i < corrupted.length(); i++)
+    for (int i = PREAMBLE_LEN+HEADER_LEN; i < corrupted.length(); i++)
     {
         if (((float)random(0, 1000) / 1000.0) < error_probability)
         {
@@ -371,18 +385,23 @@ void setup()
     digitalWrite(TX_PIN, LOW);
     reset_group();
     Serial.println("ESP32 ready: listening...");
+    received_frames2[15]="a";
+
 }
 
 void loop()
 {
+    
     if (wait_for_preamble())
     {
         Serial.println("\n✅ Preambuła znaleziona!");
         String frame = read_frame_after_preamble();
+        frame=introduce_random_errors(frame, 0.01);
         int seq_num = 0;
         int gg_num = 4;
         if (verify_frame(frame, seq_num, gg_num))
         {
+
             Serial.print("✅ RAMKA ");
             Serial.print(seq_num);
             Serial.println(" OK");
@@ -424,22 +443,6 @@ void loop()
                     }
                 }
 
-                if (group_complete)
-                {
-                    int last_seq = current_group_start + GROUP_SIZE - 1;
-                    unsigned long wait_us = BIT_LEN_US * FRAME_LEN * GROUP_SIZE * 2.5;
-                    Serial.print("⏱️ Czekam ");
-                    Serial.print(wait_us / 1000);
-                    Serial.println(" us przed ACK...");
-                    delayMicroseconds(wait_us);
-                    Serial.print("📤 Wysyłam ACK dla grupy ");
-                    Serial.print(current_group_start);
-                    Serial.print("-");
-                    Serial.println(last_seq);
-                    send_frame_burst(build_ack_frame(last_seq));
-                    group_timer_active = false;
-                }
-
                 if (group_complete && seq_num >= current_group_start + GROUP_SIZE)
                 {
                     current_group_start += GROUP_SIZE;
@@ -453,10 +456,37 @@ void loop()
                     Serial.print("➕ Dodano ramkę ");
                     Serial.println(seq_num);
                 }
-            
+
+                else if (group_complete)
+                {
+                    int last_seq = current_group_start + GROUP_SIZE - 1;
+                    int frames_left =
+                    (current_group_start + GROUP_SIZE - 1) - seq_num;
+
+                    if (frames_left <= 0) frames_left = 1;
+                    if (frames_left > GROUP_SIZE) frames_left = GROUP_SIZE;
+                    if( frames_left >=3) frames_left=2;
+                    unsigned long wait_us = BIT_LEN_US * FRAME_LEN *frames_left * 12;
+                    Serial.print("⏱️ Czekam ");
+                    Serial.println("zostalo: ");
+                    Serial.print(frames_left);
+                    Serial.print(wait_us / 1000);
+                    Serial.println(" us przed ACK...");
+                    delayMicroseconds(wait_us);
+                    Serial.print("📤 Wysyłam ACK dla grupy ");
+                    Serial.print(current_group_start);
+                    Serial.print("-");
+                    Serial.println(last_seq);
+                    ack_count++;
+                    send_frame_burst(build_ack_frame(last_seq));
+                    group_timer_active = false;
+                }
+
+    
             }
             else
             {
+                ack_count++;
                 Serial.print("📤 Wysyłam ACK dla ramki ");
                 Serial.println(seq_num);
                 delay(50);
@@ -465,6 +495,7 @@ void loop()
         }
         else
         {
+            nack_count++;
             Serial.print("❌ BŁĄD RAMKI ");
             Serial.print(seq_num);
             Serial.println(" - NACK");
@@ -496,6 +527,7 @@ void loop()
         if (missing_seq >= 0) {
             delay(500);
             Serial.print("📤 Wysyłam NACK dla ramki ");
+            nack_count++;
             Serial.println(missing_seq);
             int mask = 0;
             mask+=8*received_frames[0];
@@ -509,5 +541,23 @@ void loop()
         group_timer_active = false;
     }
 }
-
+if(received_frames2[15]!="a"){
+        Serial.print("\n===================================");
+        Serial.print("\nWyslane acki: ");
+        Serial.print(ack_count);
+        Serial.print("\nWyslane Nacki: ");
+        Serial.print(nack_count);
+        Serial.print("\n===================================\n");
+        int k=0;
+        for( String s : received_frames2){
+            Serial.print(k);
+            Serial.print(") ");
+            Serial.println(s.substring(HEADER_LEN, HEADER_LEN+DATA_BITS_LEN));
+            k++;
+            }
+        Serial.print("\n===================================");
+        while(true){
+            delay(1000);
+        }
+    }
 }
