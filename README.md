@@ -83,11 +83,7 @@ NACK maska: 4‑bitowy mask (w implementacji) określający które ramki grupy s
 - Pico: wrzuć `pico.py` na urządzenie przez Thonny / rshell / ampy.
 
 Przykład (Thonny): otwórz urządzenie → zapisz jako `main.py` lub `pico.py` na PICO.
-Przykład (Arduino CLI):
-```
-arduino-cli compile --fqbn esp32:esp32:esp32 esp32.ino
-arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 esp32.ino
-```
+Przykład (Arduino IDE): potrzeba dodać rozszerzenie od espressif systems ustawić odpowiednio ustawienei urządzenie w zalezności od wersji esp i wysłać do urządzenia
 
 ## Czego oczekiwać i testy
 - Po wgraniu: otwórz oba terminale szeregowe (115200). Nadajnik zacznie wysyłać ramki, odbiornik będzie logował preambułę, weryfikacje oraz wysyłał ACK/NACK.
