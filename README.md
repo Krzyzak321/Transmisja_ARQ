@@ -17,8 +17,8 @@ Podsumowanie projektu: prosty protokół ARQ (ACK/NACK) nadawany przez GPIO (np.
 - Nagłówek: 12 bitów:
   - 4 bity — typ ramki (DATA / ACK / NACK)
   - 4 bity — numer sekwencji (seq)
-  - 3 bity — długość/grupa (grupowanie w Selective Repeat)
-  - 1 bit — rezerwa
+  - 2 bity — długość/grupa (grupowanie w Selective Repeat aktualnei nieurzywane gotowe do dalszej implementacji)
+  - 2 bit — rezerwa
 - Dane: 26 bitów
 - Parzystość: Hamming = 5 bitów lub CRC‑4 = 4 bity (w zależności od konfiguracji)
 
